@@ -7,15 +7,19 @@ import torchvision.transforms as transforms
 from PIL import Image
 import random
 import shutil
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
 import matplotlib.pyplot as plt
 import mlflow
+import mlflow.sklearn
 import mlflow.pytorch
 from mlflow.tracking import MlflowClient
 import sqlite3
 import json
 import pickle
 from datetime import datetime
+import joblib
 
 class EdgeFaceRecognitionTrainer:
     def __init__(self, images_dir="images", mlflow_uri="sqlite:///mlflow_edge.db"):
@@ -50,16 +54,33 @@ class EdgeFaceRecognitionTrainer:
         # Feature extractor (foundation model)
         self.feature_extractor = self.load_feature_extractor()
         
+        # Random Forest model for classification
+        self.rf_model = None
+        self.label_encoder = {}
+        self.reverse_label_encoder = {}
+        
         # Face features cache
         self.face_features = {}
         self.load_face_features()
         
         # Few-shot learning parameters
-        self.similarity_threshold = 0.75
+        self.confidence_threshold = 0.6  # Changed from similarity_threshold
         self.min_examples = 3
+        
+        # Random Forest parameters
+        self.rf_params = {
+            'n_estimators': 100,
+            'max_depth': 10,
+            'min_samples_split': 2,
+            'min_samples_leaf': 1,
+            'random_state': 42
+        }
         
         # Model version tracking
         self.current_model_version = self.get_latest_model_version()
+        
+        # Load existing Random Forest model if available
+        self.load_rf_model()
 
     def get_latest_model_version(self):
         """Get the latest model version from MLflow"""
@@ -132,6 +153,22 @@ class EdgeFaceRecognitionTrainer:
             except:
                 print("Error loading face features. Starting with empty cache.")
 
+    def load_rf_model(self):
+        """Load Random Forest model from disk"""
+        rf_path = os.path.join(self.models_dir, "random_forest_model.pkl")
+        encoder_path = os.path.join(self.models_dir, "label_encoder.pkl")
+        
+        if os.path.exists(rf_path) and os.path.exists(encoder_path):
+            try:
+                self.rf_model = joblib.load(rf_path)
+                with open(encoder_path, 'rb') as f:
+                    encoders = pickle.load(f)
+                    self.label_encoder = encoders['label_encoder']
+                    self.reverse_label_encoder = encoders['reverse_label_encoder']
+                print("Loaded Random Forest model successfully!")
+            except Exception as e:
+                print(f"Error loading Random Forest model: {e}")
+
     def save_face_database(self):
         """Save face database to disk"""
         db_path = os.path.join(self.models_dir, "face_database.json")
@@ -143,6 +180,21 @@ class EdgeFaceRecognitionTrainer:
         features_path = os.path.join(self.models_dir, "face_features.pkl")
         with open(features_path, 'wb') as f:
             pickle.dump(self.face_features, f)
+
+    def save_rf_model(self):
+        """Save Random Forest model to disk"""
+        if self.rf_model is not None:
+            rf_path = os.path.join(self.models_dir, "random_forest_model.pkl")
+            encoder_path = os.path.join(self.models_dir, "label_encoder.pkl")
+            
+            joblib.dump(self.rf_model, rf_path)
+            
+            encoders = {
+                'label_encoder': self.label_encoder,
+                'reverse_label_encoder': self.reverse_label_encoder
+            }
+            with open(encoder_path, 'wb') as f:
+                pickle.dump(encoders, f)
 
     def extract_features(self, face_img):
         """Extract features from a face image using foundation model"""
@@ -211,14 +263,82 @@ class EdgeFaceRecognitionTrainer:
             
         return faces
 
+    def prepare_training_data(self):
+        """Prepare training data for Random Forest"""
+        X = []  # Features
+        y = []  # Labels
+        
+        # Create label encoder
+        unique_persons = list(set(self.face_database.values()))  # Remove duplicates
+        unique_persons = [p for p in unique_persons if p != "Unknown"]  # Remove Unknown
+        
+        if not unique_persons:
+            return np.array([]), np.array([])
+        
+        self.label_encoder = {person: idx for idx, person in enumerate(unique_persons)}
+        self.reverse_label_encoder = {idx: person for person, idx in self.label_encoder.items()}
+        
+        # Prepare training data
+        for person_id, features_list in self.face_features.items():
+            person_name = self.face_database.get(person_id, "Unknown")
+            if person_name == "Unknown" or person_name not in self.label_encoder:
+                continue
+                
+            person_label = self.label_encoder[person_name]
+            
+            for features in features_list:
+                X.append(features.flatten())
+                y.append(person_label)
+        
+        return np.array(X), np.array(y)
+
+    def train_random_forest(self):
+        """Train Random Forest classifier"""
+        print("Training Random Forest classifier...")
+        
+        X, y = self.prepare_training_data()
+        
+        if len(X) == 0:
+            print("No training data available!")
+            return False
+        
+        # Split data for validation
+        if len(X) > 10:  # Only split if we have enough data
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+        else:
+            X_train, X_val, y_train, y_val = X, X, y, y
+        
+        # Train Random Forest
+        self.rf_model = RandomForestClassifier(**self.rf_params)
+        self.rf_model.fit(X_train, y_train)
+        
+        # Validate model
+        if len(X_val) > 0:
+            y_pred = self.rf_model.predict(X_val)
+            accuracy = accuracy_score(y_val, y_pred)
+            print(f"Random Forest Validation Accuracy: {accuracy:.3f}")
+            
+            # Print classification report
+            target_names = [self.reverse_label_encoder[i] for i in sorted(self.reverse_label_encoder.keys())]
+            print("\nClassification Report:")
+            print(classification_report(y_val, y_pred, target_names=target_names, zero_division=0))
+        
+        # Save model
+        self.save_rf_model()
+        print("Random Forest model trained and saved successfully!")
+        return True
+
     def train_few_shot_model(self, person_name, image_paths):
         """Train few-shot learning model with MLflow tracking"""
         with mlflow.start_run(run_name=f"few_shot_training_{person_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
             # Log parameters
             mlflow.log_param("person_name", person_name)
             mlflow.log_param("num_examples", len(image_paths))
-            mlflow.log_param("similarity_threshold", self.similarity_threshold)
+            mlflow.log_param("confidence_threshold", self.confidence_threshold)
             mlflow.log_param("device", self.device)
+            mlflow.log_params(self.rf_params)
             
             # Create new person ID
             if self.face_database:
@@ -272,36 +392,53 @@ class EdgeFaceRecognitionTrainer:
                 self.save_face_database()
                 self.save_face_features()
                 
-                # Package model artifacts
-                model_artifacts = {
-                    "face_database": self.face_database,
-                    "face_features": self.face_features,
-                    "feature_extractor_state": self.feature_extractor.state_dict() if self.feature_extractor else None,
-                    "similarity_threshold": self.similarity_threshold,
-                    "model_type": "mobilenet_v3_small"
-                }
+                # Train Random Forest with updated data
+                rf_success = self.train_random_forest()
                 
-                # Save model package
-                model_path = os.path.join(self.models_dir, f"face_model_v{self.current_model_version + 1}.pkl")
-                with open(model_path, 'wb') as f:
-                    pickle.dump(model_artifacts, f)
-                
-                # Log model to MLflow
-                mlflow.log_artifact(model_path)
-                mlflow.log_artifact(os.path.join(self.models_dir, "face_database.json"))
-                
-                # Register model
-                mlflow.pytorch.log_model(
-                    pytorch_model=self.feature_extractor,
-                    artifact_path="feature_extractor",
-                    registered_model_name="face_recognition_model"
-                )
-                
-                self.current_model_version += 1
-                mlflow.log_metric("model_version", self.current_model_version)
-                
-                print(f"Successfully trained model for {person_name} with {successful_extractions} examples")
-                return True, new_id
+                if rf_success:
+                    # Package model artifacts
+                    model_artifacts = {
+                        "face_database": self.face_database,
+                        "face_features": self.face_features,
+                        "feature_extractor_state": self.feature_extractor.state_dict() if self.feature_extractor else None,
+                        "confidence_threshold": self.confidence_threshold,
+                        "model_type": "mobilenet_v3_small_with_random_forest",
+                        "rf_params": self.rf_params
+                    }
+                    
+                    # Save model package
+                    model_path = os.path.join(self.models_dir, f"face_model_v{self.current_model_version + 1}.pkl")
+                    with open(model_path, 'wb') as f:
+                        pickle.dump(model_artifacts, f)
+                    
+                    # Log model to MLflow
+                    mlflow.log_artifact(model_path)
+                    mlflow.log_artifact(os.path.join(self.models_dir, "face_database.json"))
+                    mlflow.log_artifact(os.path.join(self.models_dir, "random_forest_model.pkl"))
+                    
+                    # Log Random Forest model
+                    mlflow.sklearn.log_model(
+                        sk_model=self.rf_model,
+                        artifact_path="random_forest_classifier",
+                        registered_model_name="face_recognition_rf_model"
+                    )
+                    
+                    # Register feature extractor
+                    if self.feature_extractor:
+                        mlflow.pytorch.log_model(
+                            pytorch_model=self.feature_extractor,
+                            artifact_path="feature_extractor",
+                            registered_model_name="face_recognition_model"
+                        )
+                    
+                    self.current_model_version += 1
+                    mlflow.log_metric("model_version", self.current_model_version)
+                    
+                    print(f"Successfully trained model for {person_name} with {successful_extractions} examples")
+                    return True, new_id
+                else:
+                    print("Failed to train Random Forest model")
+                    return False, None
             else:
                 print(f"Insufficient examples for {person_name}. Got {successful_extractions}, need {self.min_examples}")
                 return False, None
@@ -354,43 +491,42 @@ class EdgeFaceRecognitionTrainer:
             return accuracy
 
     def recognize_face(self, face_roi):
-        """Recognize face using few-shot learning"""
-        query_features = self.extract_features(face_roi)
-        
-        best_match = "Unknown"
-        best_similarity = -1
-        best_confidence = 0
-        
-        for person_id, features_list in self.face_features.items():
-            if len(features_list) < self.min_examples:
-                continue
-                
-            similarities = []
-            for features in features_list:
-                if features.shape != query_features.shape:
-                    continue
-                    
-                sim = cosine_similarity([query_features], [features])[0][0]
-                similarities.append(sim)
-            
-            if similarities:
-                similarities.sort(reverse=True)
-                top_n = min(3, len(similarities))
-                avg_similarity = sum(similarities[:top_n]) / top_n
-                
-                if avg_similarity > best_similarity:
-                    best_similarity = avg_similarity
-                    best_match = self.face_database.get(person_id, "Unknown")
-                    best_confidence = avg_similarity * 100
-        
-        if best_similarity < self.similarity_threshold:
+        """Recognize face using Random Forest classifier"""
+        if self.rf_model is None:
             return {"name": "Unknown", "confidence": 0, "person_id": None}
         
-        return {
-            "name": best_match,
-            "confidence": best_confidence,
-            "person_id": person_id
-        }
+        # Extract features
+        query_features = self.extract_features(face_roi).flatten().reshape(1, -1)
+        
+        try:
+            # Get prediction probabilities
+            probabilities = self.rf_model.predict_proba(query_features)[0]
+            predicted_class = self.rf_model.predict(query_features)[0]
+            confidence = probabilities[predicted_class]
+            
+            # Check if confidence meets threshold
+            if confidence < self.confidence_threshold:
+                return {"name": "Unknown", "confidence": 0, "person_id": None}
+            
+            # Get person name
+            person_name = self.reverse_label_encoder.get(predicted_class, "Unknown")
+            
+            # Find person_id
+            person_id = None
+            for pid, name in self.face_database.items():
+                if name == person_name:
+                    person_id = pid
+                    break
+            
+            return {
+                "name": person_name,
+                "confidence": confidence * 100,
+                "person_id": person_id
+            }
+            
+        except Exception as e:
+            print(f"Error in face recognition: {e}")
+            return {"name": "Unknown", "confidence": 0, "person_id": None}
 
     def deploy_to_jetson(self, jetson_ip="192.168.50.94", jetson_user="newcastleuni"):
         """Deploy trained model to Jetson Nano"""
@@ -404,12 +540,14 @@ class EdgeFaceRecognitionTrainer:
         shutil.copy(os.path.join(self.models_dir, f"face_model_v{self.current_model_version}.pkl"), 
                    os.path.join(deployment_dir, "face_model.pkl"))
         shutil.copy(os.path.join(self.models_dir, "face_database.json"), deployment_dir)
+        shutil.copy(os.path.join(self.models_dir, "random_forest_model.pkl"), deployment_dir)
+        shutil.copy(os.path.join(self.models_dir, "label_encoder.pkl"), deployment_dir)
         
         # Create deployment script
         with open(os.path.join(deployment_dir, "deploy.sh"), 'w') as f:
             f.write(f"""#!/bin/bash
 # Deployment script for Jetson Nano
-echo "Deploying face recognition model to Jetson Nano..."
+echo "Deploying face recognition model with Random Forest to Jetson Nano..."
 
 # Copy files to Jetson
 scp -r ../jetson_deployment/* {jetson_user}@{jetson_ip}:~/face_recognition/models/
@@ -434,6 +572,3 @@ if __name__ == "__main__":
     success, person_id = trainer.train_few_shot_model(person_name, image_paths)
     if success:
         print(f"Successfully registered {person_name} with ID: {person_id}")
-    
-    # Deploy to Jetson
-    trainer.deploy_to_jetson()
