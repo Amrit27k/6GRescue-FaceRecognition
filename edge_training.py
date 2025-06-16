@@ -7,17 +7,19 @@ import torchvision.transforms as transforms
 from PIL import Image
 import random
 import shutil
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
 import matplotlib.pyplot as plt
 import mlflow
+import mlflow.sklearn
 import mlflow.pytorch
 from mlflow.tracking import MlflowClient
 import sqlite3
 import json
 import pickle
 from datetime import datetime
-import subprocess
-import yaml
+import joblib
 
 class EdgeFaceRecognitionTrainer:
     def __init__(self, images_dir="images", mlflow_uri="sqlite:///mlflow_edge.db"):
@@ -39,14 +41,9 @@ class EdgeFaceRecognitionTrainer:
         self.few_shot_dir = "few_shot_examples"
         self.unknown_dir = os.path.join(self.few_shot_dir, "unknown")
         self.models_dir = "models"
-        self.k8s_dir = "k8s_deployment"
         os.makedirs(self.few_shot_dir, exist_ok=True)
         os.makedirs(self.unknown_dir, exist_ok=True)
         os.makedirs(self.models_dir, exist_ok=True)
-        os.makedirs(self.k8s_dir, exist_ok=True)
-        
-        # Create deployment files if they don't exist
-        self.create_deployment_files()
         
         # Load YOLOv8 model
         self.load_yolov8_model()
@@ -57,16 +54,33 @@ class EdgeFaceRecognitionTrainer:
         # Feature extractor (foundation model)
         self.feature_extractor = self.load_feature_extractor()
         
+        # Random Forest model for classification
+        self.rf_model = None
+        self.label_encoder = {}
+        self.reverse_label_encoder = {}
+        
         # Face features cache
         self.face_features = {}
         self.load_face_features()
         
         # Few-shot learning parameters
-        self.similarity_threshold = 0.75
+        self.confidence_threshold = 0.6  # Changed from similarity_threshold
         self.min_examples = 3
+        
+        # Random Forest parameters
+        self.rf_params = {
+            'n_estimators': 100,
+            'max_depth': 10,
+            'min_samples_split': 2,
+            'min_samples_leaf': 1,
+            'random_state': 42
+        }
         
         # Model version tracking
         self.current_model_version = self.get_latest_model_version()
+        
+        # Load existing Random Forest model if available
+        self.load_rf_model()
 
     def get_latest_model_version(self):
         """Get the latest model version from MLflow"""
@@ -89,7 +103,7 @@ class EdgeFaceRecognitionTrainer:
         print("Loading YOLOv8 model...")
         try:
             from ultralytics import YOLO
-            self.model = YOLO("yolov8s.pt")  # Use face-specific model if available
+            self.model = YOLO("yolov8n-face.pt")  # Use face-specific model if available
             self.model_type = "v8"
             print("Loaded YOLOv8 model successfully!")
         except Exception as e:
@@ -139,6 +153,22 @@ class EdgeFaceRecognitionTrainer:
             except:
                 print("Error loading face features. Starting with empty cache.")
 
+    def load_rf_model(self):
+        """Load Random Forest model from disk"""
+        rf_path = os.path.join(self.models_dir, "random_forest_model.pkl")
+        encoder_path = os.path.join(self.models_dir, "label_encoder.pkl")
+        
+        if os.path.exists(rf_path) and os.path.exists(encoder_path):
+            try:
+                self.rf_model = joblib.load(rf_path)
+                with open(encoder_path, 'rb') as f:
+                    encoders = pickle.load(f)
+                    self.label_encoder = encoders['label_encoder']
+                    self.reverse_label_encoder = encoders['reverse_label_encoder']
+                print("Loaded Random Forest model successfully!")
+            except Exception as e:
+                print(f"Error loading Random Forest model: {e}")
+
     def save_face_database(self):
         """Save face database to disk"""
         db_path = os.path.join(self.models_dir, "face_database.json")
@@ -150,6 +180,21 @@ class EdgeFaceRecognitionTrainer:
         features_path = os.path.join(self.models_dir, "face_features.pkl")
         with open(features_path, 'wb') as f:
             pickle.dump(self.face_features, f)
+
+    def save_rf_model(self):
+        """Save Random Forest model to disk"""
+        if self.rf_model is not None:
+            rf_path = os.path.join(self.models_dir, "random_forest_model.pkl")
+            encoder_path = os.path.join(self.models_dir, "label_encoder.pkl")
+            
+            joblib.dump(self.rf_model, rf_path)
+            
+            encoders = {
+                'label_encoder': self.label_encoder,
+                'reverse_label_encoder': self.reverse_label_encoder
+            }
+            with open(encoder_path, 'wb') as f:
+                pickle.dump(encoders, f)
 
     def extract_features(self, face_img):
         """Extract features from a face image using foundation model"""
@@ -218,155 +263,72 @@ class EdgeFaceRecognitionTrainer:
             
         return faces
 
-    def create_mlflow_model_class(self):
-        """Create MLflow model wrapper class for deployment"""
-        model_class_code = '''
-import pickle
-import json
-import numpy as np
-import pandas as pd
-from typing import Any
-import mlflow
-from mlflow.pyfunc import PythonModel
-
-class FaceRecognitionModel(PythonModel):
-    def load_context(self, context):
-        """Load model artifacts"""
-        print("Loading face recognition model...")
+    def prepare_training_data(self):
+        """Prepare training data for Random Forest"""
+        X = []  # Features
+        y = []  # Labels
         
-        # Load face database
-        with open(context.artifacts["face_database"], 'r') as f:
-            self.face_database = json.load(f)
+        # Create label encoder
+        unique_persons = list(set(self.face_database.values()))  # Remove duplicates
+        unique_persons = [p for p in unique_persons if p != "Unknown"]  # Remove Unknown
         
-        # Load face features
-        with open(context.artifacts["face_features"], 'rb') as f:
-            self.face_features = pickle.load(f)
+        if not unique_persons:
+            return np.array([]), np.array([])
         
-        # Load model parameters
-        with open(context.artifacts["model_params"], 'r') as f:
-            params = json.load(f)
-            self.similarity_threshold = params["similarity_threshold"]
-            self.min_examples = params["min_examples"]
+        self.label_encoder = {person: idx for idx, person in enumerate(unique_persons)}
+        self.reverse_label_encoder = {idx: person for person, idx in self.label_encoder.items()}
         
-        print(f"Loaded model with {len(self.face_database)} identities")
-    
-    def extract_features_simple(self, face_img_array):
-        """Simple feature extraction using histogram (fallback)"""
-        try:
-            import cv2
-            gray = cv2.cvtColor(face_img_array.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-            hist = cv2.calcHist([gray], [0], None, [128], [0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-            return hist
-        except Exception as e:
-            print(f"Feature extraction error: {e}")
-            # Return dummy features if OpenCV fails
-            return np.random.random(128)
-    
-    def predict(self, context, model_input):
-        """Predict function for MLflow model serving"""
-        print(f"Received prediction request with {len(model_input)} instances")
-        
-        results = []
-        
-        # Handle both DataFrame and dict inputs
-        if isinstance(model_input, pd.DataFrame):
-            inputs = model_input.to_dict('records')
-        else:
-            inputs = model_input if isinstance(model_input, list) else [model_input]
-        
-        for instance in inputs:
-            try:
-                # Extract face image from input (base64 encoded)
-                if isinstance(instance, dict):
-                    face_b64 = instance.get('face_image', '')
-                else:
-                    face_b64 = instance
-                
-                if not face_b64:
-                    results.append({
-                        "name": "Unknown",
-                        "confidence": 0.0,
-                        "person_id": None,
-                        "error": "No face_image provided"
-                    })
-                    continue
-                
-                # Decode base64 image
-                import base64
-                import cv2
-                face_data = base64.b64decode(face_b64)
-                nparr = np.frombuffer(face_data, np.uint8)
-                face_img_array = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if face_img_array is None:
-                    results.append({
-                        "name": "Unknown", 
-                        "confidence": 0.0,
-                        "person_id": None,
-                        "error": "Invalid image data"
-                    })
-                    continue
-                
-                # Extract features and predict
-                query_features = self.extract_features_simple(face_img_array)
-                result = self.recognize_face(query_features)
-                results.append(result)
-                
-            except Exception as e:
-                print(f"Error processing instance: {e}")
-                results.append({
-                    "name": "Unknown",
-                    "confidence": 0.0, 
-                    "person_id": None,
-                    "error": str(e)
-                })
-        
-        return results
-    
-    def recognize_face(self, query_features):
-        """Recognize face from features"""
-        from sklearn.metrics.pairwise import cosine_similarity
-        
-        best_match = "Unknown"
-        best_similarity = -1
-        best_confidence = 0.0
-        best_person_id = None
-        
+        # Prepare training data
         for person_id, features_list in self.face_features.items():
-            if len(features_list) < self.min_examples:
+            person_name = self.face_database.get(person_id, "Unknown")
+            if person_name == "Unknown" or person_name not in self.label_encoder:
                 continue
                 
-            similarities = []
-            for features in features_list:
-                if features.shape != query_features.shape:
-                    continue
-                    
-                sim = cosine_similarity([query_features], [features])[0][0]
-                similarities.append(sim)
+            person_label = self.label_encoder[person_name]
             
-            if similarities:
-                similarities.sort(reverse=True)
-                top_n = min(3, len(similarities))
-                avg_similarity = sum(similarities[:top_n]) / top_n
-                
-                if avg_similarity > best_similarity:
-                    best_similarity = avg_similarity
-                    best_confidence = float(avg_similarity * 100)
-                    if avg_similarity >= self.similarity_threshold:
-                        best_match = self.face_database.get(person_id, "Unknown")
-                        best_person_id = person_id
+            for features in features_list:
+                X.append(features.flatten())
+                y.append(person_label)
         
-        return {
-            "name": best_match,
-            "confidence": best_confidence,
-            "person_id": best_person_id
-        }
-'''
+        return np.array(X), np.array(y)
+
+    def train_random_forest(self):
+        """Train Random Forest classifier"""
+        print("Training Random Forest classifier...")
         
-        # Save model class to file
-        with open(os.path.join(self.models_dir, "face_recognition_model.py"), 'w') as f:
-            f.write(model_class_code)
+        X, y = self.prepare_training_data()
+        
+        if len(X) == 0:
+            print("No training data available!")
+            return False
+        
+        # Split data for validation
+        if len(X) > 10:  # Only split if we have enough data
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+        else:
+            X_train, X_val, y_train, y_val = X, X, y, y
+        
+        # Train Random Forest
+        self.rf_model = RandomForestClassifier(**self.rf_params)
+        self.rf_model.fit(X_train, y_train)
+        
+        # Validate model
+        if len(X_val) > 0:
+            y_pred = self.rf_model.predict(X_val)
+            accuracy = accuracy_score(y_val, y_pred)
+            print(f"Random Forest Validation Accuracy: {accuracy:.3f}")
+            
+            # Print classification report
+            target_names = [self.reverse_label_encoder[i] for i in sorted(self.reverse_label_encoder.keys())]
+            print("\nClassification Report:")
+            print(classification_report(y_val, y_pred, target_names=target_names, zero_division=0))
+        
+        # Save model
+        self.save_rf_model()
+        print("Random Forest model trained and saved successfully!")
+        return True
 
     def train_few_shot_model(self, person_name, image_paths):
         """Train few-shot learning model with MLflow tracking"""
@@ -374,8 +336,9 @@ class FaceRecognitionModel(PythonModel):
             # Log parameters
             mlflow.log_param("person_name", person_name)
             mlflow.log_param("num_examples", len(image_paths))
-            mlflow.log_param("similarity_threshold", self.similarity_threshold)
+            mlflow.log_param("confidence_threshold", self.confidence_threshold)
             mlflow.log_param("device", self.device)
+            mlflow.log_params(self.rf_params)
             
             # Create new person ID
             if self.face_database:
@@ -429,494 +392,56 @@ class FaceRecognitionModel(PythonModel):
                 self.save_face_database()
                 self.save_face_features()
                 
-                # Create MLflow model
-                self.create_mlflow_model_class()
+                # Train Random Forest with updated data
+                rf_success = self.train_random_forest()
                 
-                # Save model parameters
-                model_params = {
-                    "similarity_threshold": self.similarity_threshold,
-                    "min_examples": self.min_examples,
-                    "model_version": self.current_model_version + 1
-                }
-                
-                params_path = os.path.join(self.models_dir, "model_params.json")
-                with open(params_path, 'w') as f:
-                    json.dump(model_params, f)
-                
-                # Log model using MLflow's Python function flavor
-                import sys
-                sys.path.append(self.models_dir)
-                from face_recognition_model import FaceRecognitionModel
-                
-                artifacts = {
-                    "face_database": os.path.join(self.models_dir, "face_database.json"),
-                    "face_features": os.path.join(self.models_dir, "face_features.pkl"),
-                    "model_params": params_path
-                }
-                
-                # Log the model
-                mlflow.pyfunc.log_model(
-                    artifact_path="face_recognition_model",
-                    python_model=FaceRecognitionModel(),
-                    artifacts=artifacts,
-                    registered_model_name="face_recognition_model"
-                )
-                
-                self.current_model_version += 1
-                mlflow.log_metric("model_version", self.current_model_version)
-                
-                print(f"Successfully trained model for {person_name} with {successful_extractions} examples")
-                return True, new_id
+                if rf_success:
+                    # Package model artifacts
+                    model_artifacts = {
+                        "face_database": self.face_database,
+                        "face_features": self.face_features,
+                        "feature_extractor_state": self.feature_extractor.state_dict() if self.feature_extractor else None,
+                        "confidence_threshold": self.confidence_threshold,
+                        "model_type": "mobilenet_v3_small_with_random_forest",
+                        "rf_params": self.rf_params
+                    }
+                    
+                    # Save model package
+                    model_path = os.path.join(self.models_dir, f"face_model_v{self.current_model_version + 1}.pkl")
+                    with open(model_path, 'wb') as f:
+                        pickle.dump(model_artifacts, f)
+                    
+                    # Log model to MLflow
+                    mlflow.log_artifact(model_path)
+                    mlflow.log_artifact(os.path.join(self.models_dir, "face_database.json"))
+                    mlflow.log_artifact(os.path.join(self.models_dir, "random_forest_model.pkl"))
+                    
+                    # Log Random Forest model
+                    mlflow.sklearn.log_model(
+                        sk_model=self.rf_model,
+                        artifact_path="random_forest_classifier",
+                        registered_model_name="face_recognition_rf_model"
+                    )
+                    
+                    # Register feature extractor
+                    if self.feature_extractor:
+                        mlflow.pytorch.log_model(
+                            pytorch_model=self.feature_extractor,
+                            artifact_path="feature_extractor",
+                            registered_model_name="face_recognition_model"
+                        )
+                    
+                    self.current_model_version += 1
+                    mlflow.log_metric("model_version", self.current_model_version)
+                    
+                    print(f"Successfully trained model for {person_name} with {successful_extractions} examples")
+                    return True, new_id
+                else:
+                    print("Failed to train Random Forest model")
+                    return False, None
             else:
                 print(f"Insufficient examples for {person_name}. Got {successful_extractions}, need {self.min_examples}")
                 return False, None
-
-    def create_k8s_manifests(self, model_version=None):
-        """Create Kubernetes manifests for Jetson deployment"""
-        if model_version is None:
-            model_version = self.current_model_version
-        
-        print(f"Creating K8s manifests for model version {model_version}...")
-        
-        # Model service deployment
-        model_service_yaml = f"""
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: face-recognition-model
-  labels:
-    app: face-recognition-model
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: face-recognition-model
-  template:
-    metadata:
-      labels:
-        app: face-recognition-model
-    spec:
-      containers:
-      - name: model-server
-        image: face-recognition-model:v{model_version}
-        ports:
-        - containerPort: 5000
-        env:
-        - name: MLFLOW_MODEL_URI
-          value: "/opt/ml/model"
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "500m"
-          limits:
-            memory: "1Gi"
-            cpu: "1000m"
-        readinessProbe:
-          httpGet:
-            path: /ping
-            port: 5000
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        livenessProbe:
-          httpGet:
-            path: /ping
-            port: 5000
-          initialDelaySeconds: 60
-          periodSeconds: 30
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: face-recognition-model-service
-spec:
-  selector:
-    app: face-recognition-model
-  ports:
-  - protocol: TCP
-    port: 80
-    targetPort: 5000
-  type: ClusterIP
-"""
-        
-        # Inference application deployment
-        inference_app_yaml = f"""
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: face-recognition-inference
-  labels:
-    app: face-recognition-inference
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: face-recognition-inference
-  template:
-    metadata:
-      labels:
-        app: face-recognition-inference
-    spec:
-      containers:
-      - name: inference-app
-        image: face-recognition-inference:v{model_version}
-        env:
-        - name: MODEL_SERVICE_URL
-          value: "http://face-recognition-model-service"
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "250m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        volumeMounts:
-        - name: camera-device
-          mountPath: /dev/video0
-        securityContext:
-          privileged: true
-      volumes:
-      - name: camera-device
-        hostPath:
-          path: /dev/video0
-      nodeSelector:
-        kubernetes.io/arch: arm64
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: face-recognition-inference-service
-spec:
-  selector:
-    app: face-recognition-inference
-  ports:
-  - protocol: TCP
-    port: 8080
-    targetPort: 8080
-  type: NodePort
-"""
-        
-        # Save manifests
-        with open(os.path.join(self.k8s_dir, "model-service.yaml"), 'w') as f:
-            f.write(model_service_yaml)
-        
-        with open(os.path.join(self.k8s_dir, "inference-app.yaml"), 'w') as f:
-            f.write(inference_app_yaml)
-        
-        # Create deployment script
-        deployment_script = f"""#!/bin/bash
-set -e
-
-echo "Deploying Face Recognition System to Jetson k3s..."
-
-# Model version
-MODEL_VERSION=v{model_version}
-
-# Import model service image to k3s
-echo "Loading model image to k3s..."
-if [ -f "face-recognition-model-v{model_version}.tar" ]; then
-    sudo k3s ctr images import face-recognition-model-v{model_version}.tar
-    echo "✓ Model service image imported"
-else
-    echo "ERROR: Model service image not found!"
-    exit 1
-fi
-
-# Build inference application Docker image
-echo "Building inference application..."
-sudo docker build -t face-recognition-inference:$MODEL_VERSION -f Dockerfile.inference .
-
-# Save inference image
-echo "Saving inference application image..."
-sudo docker save face-recognition-inference:$MODEL_VERSION -o face-recognition-inference-v{model_version}.tar
-
-# Fix permissions
-sudo chown $USER:$USER face-recognition-inference-v{model_version}.tar
-
-# Import inference image to k3s
-echo "Loading inference image to k3s..."
-sudo k3s ctr images import face-recognition-inference-v{model_version}.tar
-
-# Apply model service
-echo "Deploying model service..."
-kubectl apply -f model-service.yaml
-
-# Wait for model service to be ready
-echo "Waiting for model service to be ready..."
-kubectl wait --for=condition=available --timeout=300s deployment/face-recognition-model
-
-# Apply inference application
-echo "Deploying inference application..."
-kubectl apply -f inference-app.yaml
-
-# Wait for inference app to be ready
-echo "Waiting for inference application to be ready..."
-kubectl wait --for=condition=available --timeout=300s deployment/face-recognition-inference
-
-echo "Deployment complete!"
-
-# Get service information
-echo "Getting service information..."
-kubectl get pods
-kubectl get services
-
-echo "Access URLs:"
-INFERENCE_NODEPORT=$(kubectl get service face-recognition-inference-service -o jsonpath='{{.spec.ports[0].nodePort}}')
-JETSON_IP=$(hostname -I | awk '{{print $1}}')
-echo "Inference Web Interface: http://$JETSON_IP:$INFERENCE_NODEPORT"
-"""
-        
-        with open(os.path.join(self.k8s_dir, "deploy.sh"), 'w') as f:
-            f.write(deployment_script)
-        
-        os.chmod(os.path.join(self.k8s_dir, "deploy.sh"), 0o755)
-        
-        print(f"K8s manifests created in {self.k8s_dir}/")
-
-    def build_docker_model(self, model_version=None):
-        """Build Docker image for MLflow model using custom Dockerfile"""
-        if model_version is None:
-            model_version = self.current_model_version
-        
-        print(f"Building Docker image for model version {model_version}...")
-        
-        try:
-            # First, let MLflow generate the basic model files
-            model_uri = f"models:/face_recognition_model/{model_version}"
-            
-            # Create temporary directory for model artifacts in the main directory
-            temp_model_dir = f"temp_model_v{model_version}"
-            if os.path.exists(temp_model_dir):
-                import shutil
-                shutil.rmtree(temp_model_dir)
-            os.makedirs(temp_model_dir, exist_ok=True)
-            
-            # Download model artifacts
-            print(f"Downloading model artifacts from {model_uri}...")
-            import mlflow.artifacts
-            mlflow.artifacts.download_artifacts(model_uri, dst_path=temp_model_dir)
-            
-            # List what was downloaded
-            print("Downloaded artifacts:")
-            for root, dirs, files in os.walk(temp_model_dir):
-                for file in files:
-                    print(f"  {os.path.join(root, file)}")
-            
-            # Create a lightweight Dockerfile optimized for Jetson
-            dockerfile_content = f"""FROM python:3.8-slim
-
-# Install only essential system dependencies
-RUN apt-get update && \\
-    apt-get install -y --no-install-recommends \\
-        curl \\
-        ca-certificates && \\
-    rm -rf /var/lib/apt/lists/* && \\
-    apt-get clean
-
-# Install only required Python dependencies (no PyTorch for model serving)
-RUN pip install --no-cache-dir \\
-    mlflow==2.8.1 \\
-    pandas \\
-    numpy \\
-    scikit-learn \\
-    Pillow \\
-    flask \\
-    gunicorn
-
-# Set working directory
-WORKDIR /opt/ml/model
-
-# Copy model artifacts
-COPY {temp_model_dir}/ /opt/ml/model/
-
-# Expose port
-EXPOSE 5000
-
-# Set environment variables
-ENV MLFLOW_MODEL_URI=/opt/ml/model
-ENV PYTHONPATH=/opt/ml/model
-ENV PYTHONUNBUFFERED=1
-
-# Use gunicorn for better performance
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", "mlflow.pyfunc.scoring_server.wsgi:app"]
-"""
-            
-            # Save Dockerfile in the main directory
-            dockerfile_path = f"Dockerfile.model.v{model_version}"
-            
-            # Remove any existing Dockerfile to ensure clean build
-            if os.path.exists(dockerfile_path):
-                os.remove(dockerfile_path)
-                print(f"Removed existing {dockerfile_path}")
-            
-            with open(dockerfile_path, 'w') as f:
-                f.write(dockerfile_content)
-            
-            print(f"Created Dockerfile: {dockerfile_path}")
-            
-            # Verify the Dockerfile content
-            print("Dockerfile content preview:")
-            with open(dockerfile_path, 'r') as f:
-                lines = f.readlines()
-                for i, line in enumerate(lines[:10], 1):  # Show first 10 lines
-                    print(f"  {i:2d}: {line.rstrip()}")
-                if len(lines) > 10:
-                    print(f"  ... ({len(lines)} total lines)")
-
-            
-            # Build Docker image with sudo from the main directory
-            image_name = f"face-recognition-model:v{model_version}"
-            
-            build_cmd = [
-                "sudo", "docker", "build",
-                "-f", dockerfile_path,
-                "-t", image_name,
-                # "--platform", "linux/arm64",  # Remove this for now to test basic build
-                "."
-            ]
-            
-            print(f"Running: {' '.join(build_cmd)}")
-            print(f"Build context: {os.getcwd()}")
-            
-            # Show what files are available for Docker build
-            print("Files available for Docker build:")
-            for item in os.listdir('.'):
-                if os.path.isdir(item):
-                    print(f"  📁 {item}/")
-                else:
-                    print(f"  📄 {item}")
-            
-            result = subprocess.run(build_cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"✅ Successfully built Docker image: {image_name}")
-                
-                # Save image as tar for transfer with sudo
-                tar_filename = f"face-recognition-model-v{model_version}.tar"
-                save_cmd = ["sudo", "docker", "save", image_name, "-o", tar_filename]
-                print(f"Running: {' '.join(save_cmd)}")
-                save_result = subprocess.run(save_cmd, capture_output=True, text=True)
-                
-                if save_result.returncode == 0:
-                    print(f"✅ Docker image saved as: {tar_filename}")
-                    
-                    # Fix permissions on the tar file
-                    current_user = os.getenv('USER', 'root')
-                    chown_cmd = ["sudo", "chown", f"{current_user}:{current_user}", tar_filename]
-                    subprocess.run(chown_cmd)
-                    
-                    # Move tar file to k8s_deployment directory
-                    os.makedirs(self.k8s_dir, exist_ok=True)
-                    final_tar_path = os.path.join(self.k8s_dir, tar_filename)
-                    if os.path.exists(final_tar_path):
-                        os.remove(final_tar_path)
-                    shutil.move(tar_filename, final_tar_path)
-                    
-                    # Cleanup temp files
-                    import shutil
-                    shutil.rmtree(temp_model_dir)
-                    os.remove(dockerfile_path)
-                    
-                    print(f"✅ Docker image moved to: {final_tar_path}")
-                    return True
-                else:
-                    print(f"❌ Error saving Docker image: {save_result.stderr}")
-                    return False
-            else:
-                print(f"❌ Error building Docker image:")
-                print(f"STDERR: {result.stderr}")
-                if result.stdout:
-                    print(f"STDOUT: {result.stdout}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error building Docker image: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def deploy_to_jetson_k3s(self, jetson_ip="192.168.50.94", jetson_user="newcastleuni"):
-        """Deploy trained model to Jetson k3s cluster"""
-        print(f"Deploying model version {self.current_model_version} to Jetson k3s...")
-        
-        # Create K8s manifests
-        self.create_k8s_manifests()
-        
-        # Build Docker image
-        if not self.build_docker_model():
-            print("Failed to build Docker image")
-            return False
-        
-        try:
-            # First, create necessary directories on Jetson
-            print("Creating directories on Jetson...")
-            ssh_cmd = f"""ssh {jetson_user}@{jetson_ip} '
-                mkdir -p ~/face_recognition &&
-                mkdir -p ~/k8s_deployment &&
-                echo "Directories created successfully"
-            '"""
-            
-            result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"Warning: Could not create directories: {result.stderr}")
-                # Continue anyway, directories might already exist
-            
-            # Create deployment package
-            deployment_package = f"k3s_deployment_v{self.current_model_version}.tar.gz"
-            
-            print("Creating deployment package...")
-            # Package files
-            import tarfile
-            with tarfile.open(deployment_package, "w:gz") as tar:
-                tar.add(self.k8s_dir, arcname="k8s_deployment")
-            
-            print(f"Created deployment package: {deployment_package}")
-            
-            # Copy deployment package to Jetson home directory first
-            print("Copying deployment package to Jetson...")
-            scp_cmd = f"scp {deployment_package} {jetson_user}@{jetson_ip}:~/"
-            result = subprocess.run(scp_cmd, shell=True, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                print(f"Failed to copy deployment package: {result.stderr}")
-                return False
-            
-            print("✅ Deployment package copied successfully")
-            
-            # SSH and deploy
-            print("Extracting and deploying on Jetson...")
-            ssh_deploy_cmd = f"""ssh {jetson_user}@{jetson_ip} '
-                cd ~ &&
-                tar -xzf {deployment_package} &&
-                cd k8s_deployment &&
-                chmod +x deploy.sh &&
-                echo "Ready to deploy. Run ./deploy.sh to complete deployment."
-            '"""
-            
-            result = subprocess.run(ssh_deploy_cmd, shell=True, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print("✅ Files extracted successfully on Jetson!")
-                print("\n" + "="*50)
-                print("DEPLOYMENT READY!")
-                print("="*50)
-                print(f"SSH to Jetson: ssh {jetson_user}@{jetson_ip}")
-                print("Then run: cd k8s_deployment && ./deploy.sh")
-                print("="*50)
-                
-                # Cleanup local package
-                if os.path.exists(deployment_package):
-                    os.remove(deployment_package)
-                
-                return True
-            else:
-                print(f"Deployment preparation failed: {result.stderr}")
-                return False
-                
-        except Exception as e:
-            print(f"Error deploying to Jetson: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
 
     def evaluate_model(self, test_image_paths):
         """Evaluate model performance"""
@@ -930,6 +455,7 @@ CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", 
             
             for img_path in test_image_paths:
                 # Extract ground truth from filename or path
+                # Assuming format: person_name_*.jpg
                 filename = os.path.basename(img_path)
                 ground_truth = filename.split('_')[0]
                 
@@ -965,419 +491,73 @@ CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", 
             return accuracy
 
     def recognize_face(self, face_roi):
-        """Recognize face using few-shot learning"""
-        query_features = self.extract_features(face_roi)
-        
-        best_match = "Unknown"
-        best_similarity = -1
-        best_confidence = 0
-        
-        for person_id, features_list in self.face_features.items():
-            if len(features_list) < self.min_examples:
-                continue
-                
-            similarities = []
-            for features in features_list:
-                if features.shape != query_features.shape:
-                    continue
-                    
-                sim = cosine_similarity([query_features], [features])[0][0]
-                similarities.append(sim)
-            
-            if similarities:
-                similarities.sort(reverse=True)
-                top_n = min(3, len(similarities))
-                avg_similarity = sum(similarities[:top_n]) / top_n
-                
-                if avg_similarity > best_similarity:
-                    best_similarity = avg_similarity
-                    best_match = self.face_database.get(person_id, "Unknown")
-                    best_confidence = avg_similarity * 100
-        
-        if best_similarity < self.similarity_threshold:
+        """Recognize face using Random Forest classifier"""
+        if self.rf_model is None:
             return {"name": "Unknown", "confidence": 0, "person_id": None}
         
-    def create_deployment_files(self):
-        """Create necessary deployment files"""
-        print("📝 Creating deployment files...")
-        
-        # Create Dockerfile.inference
-        dockerfile_inference_content = """# Dockerfile for Jetson Inference Application
-FROM nvcr.io/nvidia/l4t-base:r32.7.1
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \\
-    python3 \\
-    python3-pip \\
-    python3-dev \\
-    python3-opencv \\
-    libopencv-dev \\
-    pkg-config \\
-    wget \\
-    curl \\
-    gstreamer1.0-tools \\
-    gstreamer1.0-plugins-base \\
-    gstreamer1.0-plugins-good \\
-    gstreamer1.0-plugins-bad \\
-    gstreamer1.0-plugins-ugly \\
-    gstreamer1.0-libav \\
-    libgstreamer1.0-dev \\
-    libgstreamer-plugins-base1.0-dev \\
-    libglib2.0-0 \\
-    libsm6 \\
-    libxext6 \\
-    libxrender-dev \\
-    libgomp1 \\
-    && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
-WORKDIR /app
-
-# Copy requirements and install Python dependencies
-COPY requirements_jetson.txt .
-RUN pip3 install --no-cache-dir -r requirements_jetson.txt
-
-# Copy application files
-COPY jetson_inference.py .
-
-# Create output directory
-RUN mkdir -p output
-
-# Expose web server port
-EXPOSE 8080
-
-# Set environment variables
-ENV PYTHONPATH=/app
-ENV MODEL_SERVICE_URL=http://face-recognition-model-service
-ENV PYTHONUNBUFFERED=1
-
-# Run the inference application in web mode
-CMD ["python3", "jetson_inference.py", "--web", "--no-display"]
-"""
-        
-        with open("Dockerfile.inference", "w") as f:
-            f.write(dockerfile_inference_content)
-        
-        # Create requirements_jetson.txt
-        requirements_jetson_content = """# Jetson Inference Requirements (No MLflow)
-opencv-python==4.5.5.64
-numpy==1.19.5
-requests==2.28.1
-flask==2.2.2
-Pillow==9.2.0
-scikit-learn==1.0.2
-gunicorn==21.2.0
-"""
-        
-        with open("requirements_jetson.txt", "w") as f:
-            f.write(requirements_jetson_content)
-        
-        print("✅ Created Dockerfile.inference")
-        print("✅ Created requirements_jetson.txt")
-        
-        return True
-
-    def create_lightweight_deployment(self, model_version=None):
-        """Create a lightweight deployment without heavy Docker images"""
-        if model_version is None:
-            model_version = self.current_model_version
-        
-        print(f"Creating lightweight deployment for model version {model_version}...")
+        # Extract features
+        query_features = self.extract_features(face_roi).flatten().reshape(1, -1)
         
         try:
-            # Create lightweight deployment directory
-            lightweight_dir = f"lightweight_deployment_v{model_version}"
-            if os.path.exists(lightweight_dir):
-                shutil.rmtree(lightweight_dir)
-            os.makedirs(lightweight_dir, exist_ok=True)
+            # Get prediction probabilities
+            probabilities = self.rf_model.predict_proba(query_features)[0]
+            predicted_class = self.rf_model.predict(query_features)[0]
+            confidence = probabilities[predicted_class]
             
-            # Copy only essential model files
-            model_files_to_copy = [
-                "face_database.json",
-                "face_features.pkl", 
-                "model_params.json"
-            ]
+            # Check if confidence meets threshold
+            if confidence < self.confidence_threshold:
+                return {"name": "Unknown", "confidence": 0, "person_id": None}
             
-            for file in model_files_to_copy:
-                src_path = os.path.join(self.models_dir, file)
-                if os.path.exists(src_path):
-                    shutil.copy2(src_path, lightweight_dir)
-                    print(f"✅ Copied {file}")
+            # Get person name
+            person_name = self.reverse_label_encoder.get(predicted_class, "Unknown")
             
-            # Create a simple Python model server script
-            model_server_script = f'''#!/usr/bin/env python3
-"""
-Lightweight MLflow model server for Jetson deployment
-No heavy dependencies - only essential packages
-"""
-import json
-import pickle
-import numpy as np
-from flask import Flask, request, jsonify
-import logging
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
-
-class LightweightFaceRecognitionModel:
-    def __init__(self):
-        self.load_model_artifacts()
-    
-    def load_model_artifacts(self):
-        """Load model artifacts"""
-        try:
-            # Load face database
-            with open('face_database.json', 'r') as f:
-                self.face_database = json.load(f)
+            # Find person_id
+            person_id = None
+            for pid, name in self.face_database.items():
+                if name == person_name:
+                    person_id = pid
+                    break
             
-            # Load face features
-            with open('face_features.pkl', 'rb') as f:
-                self.face_features = pickle.load(f)
-            
-            # Load model parameters
-            with open('model_params.json', 'r') as f:
-                params = json.load(f)
-                self.similarity_threshold = params["similarity_threshold"]
-                self.min_examples = params["min_examples"]
-            
-            logger.info(f"Loaded model with {{len(self.face_database)}} identities")
+            return {
+                "name": person_name,
+                "confidence": confidence * 100,
+                "person_id": person_id
+            }
             
         except Exception as e:
-            logger.error(f"Error loading model artifacts: {{e}}")
-            raise
-    
-    def extract_features_simple(self, face_img_array):
-        """Simple feature extraction using histogram (fallback)"""
-        import cv2
-        gray = cv2.cvtColor(face_img_array.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-        hist = cv2.calcHist([gray], [0], None, [128], [0, 256])
-        hist = cv2.normalize(hist, hist).flatten()
-        return hist
-    
-    def predict(self, face_img_array):
-        """Predict face identity"""
-        from sklearn.metrics.pairwise import cosine_similarity
+            print(f"Error in face recognition: {e}")
+            return {"name": "Unknown", "confidence": 0, "person_id": None}
+
+    def deploy_to_jetson(self, jetson_ip="192.168.50.94", jetson_user="newcastleuni"):
+        """Deploy trained model to Jetson Nano"""
+        print(f"Deploying model version {self.current_model_version} to Jetson Nano...")
         
-        query_features = self.extract_features_simple(face_img_array)
+        # Create deployment package
+        deployment_dir = "jetson_deployment"
+        os.makedirs(deployment_dir, exist_ok=True)
         
-        best_match = "Unknown"
-        best_similarity = -1
-        best_confidence = 0
+        # Copy model files
+        shutil.copy(os.path.join(self.models_dir, f"face_model_v{self.current_model_version}.pkl"), 
+                   os.path.join(deployment_dir, "face_model.pkl"))
+        shutil.copy(os.path.join(self.models_dir, "face_database.json"), deployment_dir)
+        shutil.copy(os.path.join(self.models_dir, "random_forest_model.pkl"), deployment_dir)
+        shutil.copy(os.path.join(self.models_dir, "label_encoder.pkl"), deployment_dir)
         
-        for person_id, features_list in self.face_features.items():
-            if len(features_list) < self.min_examples:
-                continue
-                
-            similarities = []
-            for features in features_list:
-                if features.shape != query_features.shape:
-                    continue
-                    
-                sim = cosine_similarity([query_features], [features])[0][0]
-                similarities.append(sim)
-            
-            if similarities:
-                similarities.sort(reverse=True)
-                top_n = min(3, len(similarities))
-                avg_similarity = sum(similarities[:top_n]) / top_n
-                
-                if avg_similarity > best_similarity:
-                    best_similarity = avg_similarity
-                    best_confidence = avg_similarity * 100
-                    if avg_similarity >= self.similarity_threshold:
-                        best_match = self.face_database.get(person_id, "Unknown")
+        # Create deployment script
+        with open(os.path.join(deployment_dir, "deploy.sh"), 'w') as f:
+            f.write(f"""#!/bin/bash
+# Deployment script for Jetson Nano
+echo "Deploying face recognition model with Random Forest to Jetson Nano..."
+
+# Copy files to Jetson
+scp -r ../jetson_deployment/* {jetson_user}@{jetson_ip}:~/face_recognition/models/
+
+echo "Deployment complete!"
+""")
         
-        return {{
-            "name": best_match,
-            "confidence": best_confidence,
-            "person_id": person_id if best_match != "Unknown" else None
-        }}
-
-# Initialize model
-model = LightweightFaceRecognitionModel()
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    return "pong"
-
-@app.route('/invocations', methods=['POST'])
-def predict():
-    try:
-        data = request.get_json()
-        instances = data.get('instances', [])
-        
-        results = []
-        for instance in instances:
-            # Decode base64 image
-            import base64
-            face_b64 = instance.get('face_image', '')
-            face_data = base64.b64decode(face_b64)
-            
-            # Convert to numpy array
-            import cv2
-            nparr = np.frombuffer(face_data, np.uint8)
-            face_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            # Predict
-            result = model.predict(face_img)
-            results.append(result)
-        
-        return jsonify({{"predictions": results}})
-        
-    except Exception as e:
-        logger.error(f"Prediction error: {{e}}")
-        return jsonify({{"error": str(e)}}), 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
-'''
-            
-            # Save the model server script
-            with open(os.path.join(lightweight_dir, "model_server.py"), 'w') as f:
-                f.write(model_server_script)
-            
-            # Create requirements.txt for lightweight deployment
-            requirements_content = """flask==2.3.3
-numpy==1.24.3
-opencv-python==4.8.0.76
-scikit-learn==1.3.0
-gunicorn==21.2.0
-"""
-            
-            with open(os.path.join(lightweight_dir, "requirements.txt"), 'w') as f:
-                f.write(requirements_content)
-            
-            # Create Dockerfile for lightweight deployment
-            lightweight_dockerfile = """FROM python:3.8-slim
-
-# Install system dependencies
-RUN apt-get update && \\
-    apt-get install -y --no-install-recommends \\
-        libglib2.0-0 \\
-        libsm6 \\
-        libxext6 \\
-        libxrender-dev \\
-        libgomp1 \\
-        curl && \\
-    rm -rf /var/lib/apt/lists/*
-
-# Set working directory
-WORKDIR /app
-
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy model files
-COPY . .
-
-# Expose port
-EXPOSE 5000
-
-# Run the lightweight server
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", "model_server:app"]
-"""
-            
-            with open(os.path.join(lightweight_dir, "Dockerfile"), 'w') as f:
-                f.write(lightweight_dockerfile)
-            
-            # Create deployment script that includes auto-deployment
-            deploy_script = f"""#!/bin/bash
-# Deploy lightweight face recognition model with automatic k3s deployment
-
-echo "🚀 Deploying lightweight face recognition model..."
-
-# Build lightweight Docker image
-sudo docker build -t face-recognition-lightweight:v{model_version} .
-
-# Save as tar (should be much smaller)
-sudo docker save face-recognition-lightweight:v{model_version} -o face-recognition-lightweight-v{model_version}.tar
-
-# Fix permissions
-sudo chown $USER:$USER face-recognition-lightweight-v{model_version}.tar
-
-# Check size
-echo "📊 Image size:"
-ls -lh face-recognition-lightweight-v{model_version}.tar
-
-echo "✅ Lightweight deployment ready!"
-echo "Image size should be under 1GB"
-
-# Ask if user wants to auto-deploy to k3s
-echo ""
-read -p "🤖 Auto-deploy to k3s now? (y/N): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "🚀 Starting automatic k3s deployment..."
-    python3 auto_deploy.py --model-version {model_version}
-else
-    echo "📋 To deploy manually later, run:"
-    echo "   python3 auto_deploy.py --model-version {model_version}"
-fi
-"""
-            
-            with open(os.path.join(lightweight_dir, "build.sh"), 'w') as f:
-                f.write(deploy_script)
-            
-            os.chmod(os.path.join(lightweight_dir, "build.sh"), 0o755)
-            
-            # Copy the auto-deployment script
-            auto_deploy_script = '''#!/usr/bin/env python3
-"""
-Automatic deployment script for Jetson k3s
-This script automatically deploys the face recognition system to k3s
-"""
-# [The full auto_deploy.py content would go here - truncated for brevity]
-# Copy the entire auto_deploy_script content from the previous artifact
-'''
-            
-            with open(os.path.join(lightweight_dir, "auto_deploy.py"), 'w') as f:
-                # Read the auto_deploy.py content and write it
-                # For brevity, I'll create a reference to copy the file
-                f.write("# Auto-deployment script - copy from auto_deploy.py artifact\n")
-                f.write("# This will be the complete auto_deploy.py script\n")
-            
-            os.chmod(os.path.join(lightweight_dir, "auto_deploy.py"), 0o755)
-            
-            # Create package
-            package_name = f"lightweight-deployment-v{model_version}.tar.gz"
-            import tarfile
-            with tarfile.open(package_name, "w:gz") as tar:
-                tar.add(lightweight_dir, arcname=f"lightweight_deployment")
-            
-            # Check package size
-            package_size = os.path.getsize(package_name)
-            package_size_mb = package_size / (1024 * 1024)
-            
-            print(f"✅ Created lightweight deployment package: {package_name}")
-            print(f"📊 Package size: {package_size_mb:.1f} MB")
-            print(f"📁 Contents: Model artifacts + Python server + Auto-deployment script")
-            print(f"🚀 Deploy with: scp {package_name} newcastleuni@192.168.50.94:~/")
-            print(f"📋 Then on Jetson: tar -xzf {package_name} && cd lightweight_deployment && ./build.sh")
-            
-            # Also copy the auto-deployment script separately for direct use
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            auto_deploy_source = os.path.join(current_dir, "auto_deploy.py")
-            
-            # Create a standalone auto_deploy.py script
-            with open("auto_deploy.py", 'w') as f:
-                f.write(open("auto_deploy.py").read() if os.path.exists("auto_deploy.py") else 
-                       "# Auto-deployment script placeholder - copy from auto_deploy.py artifact")
-            
-            print(f"📝 Auto-deployment script: auto_deploy.py")
-            print(f"   Copy to Jetson for direct deployment: scp auto_deploy.py newcastleuni@192.168.50.94:~/")
-            
-            # Cleanup
-            shutil.rmtree(lightweight_dir)
-            
-            return package_name
-            
-        except Exception as e:
-            print(f"❌ Error creating lightweight deployment: {e}")
-            return None
+        os.chmod(os.path.join(deployment_dir, "deploy.sh"), 0o755)
+        print(f"Deployment package created in {deployment_dir}")
+        print(f"Run './deploy.sh' from the {deployment_dir} directory to deploy to Jetson")
 
 
 # Example usage
@@ -1392,27 +572,3 @@ if __name__ == "__main__":
     success, person_id = trainer.train_few_shot_model(person_name, image_paths)
     if success:
         print(f"Successfully registered {person_name} with ID: {person_id}")
-        
-        # Choose deployment method based on size constraints
-        print("\n" + "="*50)
-        print("DEPLOYMENT OPTIONS")
-        print("="*50)
-        print("1. Full Docker deployment (may be large)")
-        print("2. Lightweight deployment (recommended for Jetson)")
-        
-        choice = input("Choose deployment type (1 or 2): ").strip()
-        
-        if choice == "2":
-            # Create lightweight deployment
-            package = trainer.create_lightweight_deployment()
-            if package:
-                print(f"\n✅ Lightweight deployment created: {package}")
-                print("📋 To deploy to Jetson:")
-                print(f"   scp {package} newcastleuni@192.168.50.94:~/")
-                print("   ssh newcastleuni@192.168.50.94")
-                print(f"   tar -xzf {package}")
-                print("   cd lightweight_deployment")
-                print("   ./build.sh")
-        else:
-            # Try full deployment
-            trainer.deploy_to_jetson_k3s()
