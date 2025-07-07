@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flask-based Face Recognition Inference Service for Jetson (System packages only)"""
+"""Flask-based Face Recognition Inference Service for Jetson with RTSP Streaming"""
 import cv2
 import numpy as np
 import time
@@ -14,6 +14,8 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from flask import Flask, request, jsonify, Response
 import requests
+import signal
+import sys
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,11 +24,18 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 
-class JetsonFaceRecognition:
-    def __init__(self, model_service_url=None, temp_dir="temp_frames"):
+class JetsonFaceRecognitionRTSP:
+    def __init__(self, model_service_url=None, temp_dir="temp_frames", rtsp_port="8554"):
         # Model service URL
         self.model_service_url = model_service_url or os.environ.get('MODEL_SERVICE_URL', 'http://localhost:5000')
         logger.info(f"Using model service: {self.model_service_url}")
+        
+        # RTSP configuration
+        self.rtsp_port = rtsp_port
+        self.rtsp_process = None
+        self.rtsp_running = False
+        self.rtsp_feed_running = False
+        self.rtsp_feed_thread = None
         
         # Temporary directory for frame capture
         self.temp_dir = temp_dir
@@ -46,19 +55,22 @@ class JetsonFaceRecognition:
         self.start_time = time.time()
         self.inference_times = []
         
-        # Frame dimensions - Make sure these are supported by your camera's modes!
-        self.frame_width = 640
-        self.frame_height = 480
+        # Frame dimensions
+        self.frame_width = 1280
+        self.frame_height = 720
         
         # Most recent processed frame and results for streaming
         self.last_frame = None
         self.last_results = []
         self.last_method = "none"
         
-        # For camera streaming
+        # For camera streaming and processing
         self.camera_running = False
-        self.frame_queue = queue.Queue(maxsize=2)
+        self.processing_running = False
+        self.frame_queue = queue.Queue(maxsize=5)
+        self.processed_frame_queue = queue.Queue(maxsize=5)
         self.camera_thread = None
+        self.processing_thread = None
         
         # Detect best camera method
         self.camera_method = self.detect_camera_method()
@@ -67,6 +79,17 @@ class JetsonFaceRecognition:
             self.opencv_camera_id = self.find_opencv_camera()
         
         logger.info(f"Using camera method: {self.camera_method}")
+        
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        
+    def signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}, shutting down...")
+        self.stop_rtsp_server()
+        self.stop_streaming()
+        sys.exit(0)
         
     def detect_camera_method(self):
         """Detect the best available camera method"""
@@ -82,7 +105,6 @@ class JetsonFaceRecognition:
         # --- USB Camera Check with GStreamer ---
         logger.info("Attempting USB camera (v4l2src) detection...")
         try:
-            # First, check if v4l2src plugin exists and /dev/video0 is present
             result = subprocess.run("gst-inspect-1.0 v4l2src", shell=True, capture_output=True, text=True, timeout=5)
             if result.returncode == 0 and os.path.exists("/dev/video0"):
                 logger.info("v4l2src plugin found and /dev/video0 exists. Testing USB camera...")
@@ -129,42 +151,35 @@ class JetsonFaceRecognition:
         if location:
             cmd.extend(["filesink", f"location={location}"])
         else:
-            # If no location, use a null sink for testing pipeline validity
             cmd.append("fakesink") 
-            # For live preview during testing:
-            # cmd.extend(["nvegltransform", "!", "nveglglessink"])
         return cmd
 
     def test_csi_camera(self):
         """Test if CSI camera works by capturing a single frame"""
         test_path = os.path.join(self.temp_dir, "test_csi.jpg")
         
-        # Clean up previous test file
         if os.path.exists(test_path):
             os.remove(test_path)
             
-        # Use the helper to construct a robust command list
         gst_cmd_list = self._construct_csi_gst_command(num_buffers=1, location=test_path)
         
         logger.info(f"CSI camera test command: {' '.join(gst_cmd_list)}")
         
         try:
-            # Run the command
             result = subprocess.run(
                 gst_cmd_list,
                 capture_output=True,
                 text=True,
-                timeout=15 # Increased timeout slightly for first camera capture
+                timeout=15
             )
             
             logger.debug(f"CSI test stdout: {result.stdout.strip()}")
             logger.debug(f"CSI test stderr: {result.stderr.strip()}")
             
-            # Check return code and whether the file was created and is not empty
             success = (
                 result.returncode == 0 and
-                "ERROR:" not in result.stderr and # Look for GStreamer errors in stderr
-                "failed" not in result.stderr and # General failure keyword
+                "ERROR:" not in result.stderr and
+                "failed" not in result.stderr and
                 os.path.exists(test_path) and
                 os.path.getsize(test_path) > 0
             )
@@ -244,7 +259,7 @@ class JetsonFaceRecognition:
             
     def find_opencv_camera(self):
         """Find working OpenCV camera"""
-        for camera_id in [0, 1, 2]: # Iterate common camera IDs
+        for camera_id in [0, 1, 2]:
             logger.debug(f"Testing OpenCV camera ID: {camera_id}")
             try:
                 cap = cv2.VideoCapture(camera_id)
@@ -253,16 +268,13 @@ class JetsonFaceRecognition:
                     cap.release()
                     continue
                 
-                # Try setting properties (might fail if not supported, but doesn't hurt)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-                # For USB cams, MJPG is often preferred for higher resolutions/framerate
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G')) 
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
                 cap.set(cv2.CAP_PROP_FPS, 30)
                 
-                # Attempt to read a frame
                 ret, frame = cap.read()
-                cap.release() # Release immediately
+                cap.release()
                 
                 if ret and frame is not None and frame.size > 0:
                     logger.info(f"OpenCV camera found and working at ID: {camera_id} (captured frame shape: {frame.shape})")
@@ -288,15 +300,12 @@ class JetsonFaceRecognition:
             
     def capture_frame_gstreamer_csi(self):
         """Capture frame using CSI camera with GStreamer"""
-        # Removed shell=True, using list of arguments now
         gst_cmd_list = self._construct_csi_gst_command(num_buffers=1, location=self.temp_frame_path)
         
         try:
             if os.path.exists(self.temp_frame_path):
                 os.remove(self.temp_frame_path)
             
-            # Using subprocess.run for simplicity and better error handling
-            # It waits for the command to complete.
             result = subprocess.run(gst_cmd_list, capture_output=True, text=True, timeout=10)
             
             logger.debug(f"Capture CSI stdout: {result.stdout.strip()}")
@@ -384,7 +393,7 @@ class JetsonFaceRecognition:
             logger.error("No OpenCV camera available")
             return None
         
-        cap = None # Initialize cap to None
+        cap = None
         try:
             cap = cv2.VideoCapture(self.opencv_camera_id)
             if not cap.isOpened():
@@ -393,9 +402,9 @@ class JetsonFaceRecognition:
         
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))  # KEY FIX
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
             cap.set(cv2.CAP_PROP_FPS, 30)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer lag
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
             actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -406,8 +415,8 @@ class JetsonFaceRecognition:
                 ret, frame = cap.read()
                 if not ret:
                     logger.warning("OpenCV: Failed to read frame during warmup.")
-                    break # Exit loop if read fails
-                time.sleep(0.05) # Shorter sleep
+                    break
+                time.sleep(0.05)
         
             ret, frame = cap.read()
             
@@ -424,24 +433,17 @@ class JetsonFaceRecognition:
             return None
         finally:
             if cap is not None and cap.isOpened():
-                cap.release() # Ensure camera is released
-            
+                cap.release()
 
-    # ... (rest of your class, Flask routes, and main execution) ...
     def detect_faces(self, frame):
         """Detect faces in frame using Haar Cascade"""
         faces = []
         
         try:
             if not hasattr(self, 'detector'):
-                # Ensure the path to haarcascades is correct in a Docker container
-                # It should be available if opencv-python-headless is installed.
-                # You might need to add `opencv-data` package in your Dockerfile.
                 haar_cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
                 if not os.path.exists(haar_cascade_path):
                     logger.error(f"Haar cascade file not found: {haar_cascade_path}")
-                    # You might need to download it or ensure opencv-data is installed
-                    # Example: `RUN apt-get update && apt-get install -y opencv-data` in Dockerfile
                     return []
                 self.detector = cv2.CascadeClassifier(haar_cascade_path)
             
@@ -539,20 +541,214 @@ class JetsonFaceRecognition:
             logger.error(f"Error calling model service: {e}")
             return {"name": "Error", "confidence": 0, "person_id": None}
 
+    def start_rtsp_server(self):
+        """Start RTSP server that will stream processed frames"""
+        if self.rtsp_running:
+            logger.warning("RTSP server already running")
+            return True
+            
+        try:
+            # For now, let's use the simpler approach - stream raw camera with overlays added via a separate process
+            # This avoids the complexity of the named pipe approach
+            
+            # Choose appropriate GStreamer pipeline based on camera method
+            if self.camera_method == "csi":
+                gst_pipeline = (
+                    f"nvarguscamerasrc ! "
+                    f"video/x-raw(memory:NVMM),width={self.frame_width},height={self.frame_height},framerate=30/1 ! "
+                    f"nvvidconv ! "
+                    f"nvv4l2h264enc bitrate=2000000 ! "
+                    f"h264parse ! "
+                    f"rtph264pay name=pay0 pt=96"
+                )
+            else:
+                # Fallback pipeline for USB/OpenCV cameras
+                gst_pipeline = (
+                    f"v4l2src device=/dev/video0 ! "
+                    f"videoconvert ! "
+                    f"videoscale ! "
+                    f"video/x-raw,width={self.frame_width},height={self.frame_height},framerate=30/1 ! "
+                    f"x264enc tune=zerolatency bitrate=2000 speed-preset=superfast ! "
+                    f"h264parse ! "
+                    f"rtph264pay name=pay0 pt=96"
+                )
+            
+            # Use the compiled test-launch binary
+            rtsp_cmd = [
+                "/app/test-launch",
+                f"( {gst_pipeline} )"
+            ]
+            
+            logger.info(f"Starting RTSP server with camera pipeline: {gst_pipeline}")
+            
+            # Start RTSP server process (no stdin needed for direct camera access)
+            self.rtsp_process = subprocess.Popen(
+                rtsp_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            # Give it a moment to start
+            time.sleep(2)
+            
+            # Check if process is still running
+            if self.rtsp_process.poll() is None:
+                self.rtsp_running = True
+                logger.info(f"RTSP server started on port {self.rtsp_port}")
+                logger.info(f"Raw camera stream available at: rtsp://localhost:{self.rtsp_port}/test")
+                logger.info("Note: This streams raw camera feed. For processed frames with overlays, use /capture endpoint")
+                return True
+            else:
+                stdout, stderr = self.rtsp_process.communicate()
+                logger.error(f"RTSP server failed to start. stdout: {stdout}, stderr: {stderr}")
+                return False
+            
+        except Exception as e:
+            logger.error(f"Error starting RTSP server: {e}")
+            return False
+    
+    # Remove the problematic _rtsp_feed_loop method - not needed with direct camera access
+    
+    def stop_rtsp_server(self):
+        """Stop RTSP server"""
+        self.rtsp_running = False
+        self.rtsp_feed_running = False
+        
+        # Wait for feed thread to stop
+        if hasattr(self, 'rtsp_feed_thread') and self.rtsp_feed_thread and self.rtsp_feed_thread.is_alive():
+            self.rtsp_feed_thread.join(timeout=3)
+        
+        # Stop RTSP process
+        if self.rtsp_process:
+            try:
+                if self.rtsp_process.stdin:
+                    self.rtsp_process.stdin.close()
+                self.rtsp_process.terminate()
+                self.rtsp_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.rtsp_process.kill()
+                self.rtsp_process.wait()
+            except Exception as e:
+                logger.debug(f"Error stopping RTSP process: {e}")
+            finally:
+                self.rtsp_process = None
+                logger.info("RTSP server stopped")
+        
+        # Clean up named pipe
+        if hasattr(self, 'rtsp_pipe_path') and os.path.exists(self.rtsp_pipe_path):
+            try:
+                os.unlink(self.rtsp_pipe_path)
+            except Exception as e:
+                logger.debug(f"Error removing pipe: {e}")
+
+    def start_streaming(self):
+        """Start continuous camera streaming and processing"""
+        if self.camera_running:
+            logger.warning("Streaming already running")
+            return
+            
+        self.camera_running = True
+        self.processing_running = True
+        
+        # Start camera capture thread
+        self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
+        self.camera_thread.start()
+        
+        # Start processing thread
+        self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
+        self.processing_thread.start()
+        
+        logger.info("Streaming started")
+        
+    def stop_streaming(self):
+        """Stop continuous streaming"""
+        self.camera_running = False
+        self.processing_running = False
+        
+        if self.camera_thread:
+            self.camera_thread.join(timeout=2)
+        if self.processing_thread:
+            self.processing_thread.join(timeout=2)
+            
+        logger.info("Streaming stopped")
+        
+    def _camera_loop(self):
+        """Continuous camera capture loop"""
+        while self.camera_running:
+            try:
+                frame = self.capture_frame()
+                if frame is not None:
+                    # Add frame to queue (non-blocking)
+                    try:
+                        self.frame_queue.put_nowait(frame)
+                    except queue.Full:
+                        # Remove oldest frame and add new one
+                        try:
+                            self.frame_queue.get_nowait()
+                            self.frame_queue.put_nowait(frame)
+                        except queue.Empty:
+                            pass
+                            
+                time.sleep(1/30)  # ~30 FPS
+                
+            except Exception as e:
+                logger.error(f"Error in camera loop: {e}")
+                time.sleep(1)
+                
+    def _processing_loop(self):
+        """Continuous frame processing loop"""
+        while self.processing_running:
+            try:
+                # Get frame from queue
+                frame = self.frame_queue.get(timeout=1)
+                
+                # Process frame
+                faces, processed_frame = self.process_frame(frame)
+                
+                # Store results
+                self.last_frame = processed_frame.copy()
+                self.last_results = faces
+                
+                # Add to processed frame queue
+                try:
+                    self.processed_frame_queue.put_nowait(processed_frame)
+                except queue.Full:
+                    try:
+                        self.processed_frame_queue.get_nowait()
+                        self.processed_frame_queue.put_nowait(processed_frame)
+                    except queue.Empty:
+                        pass
+                        
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in processing loop: {e}")
+                time.sleep(0.1)
+
 # Initialize face recognition system
-face_recognition = JetsonFaceRecognition()
+face_recognition = JetsonFaceRecognitionRTSP()
 
 # Flask routes
 @app.route("/")
 def root():
     """API root - provides basic info"""
     return jsonify({
-        "name": "Jetson Face Recognition API (Flask)",
-        "version": "1.0",
+        "name": "Jetson Face Recognition API with RTSP (Flask)",
+        "version": "2.0",
         "camera_method": face_recognition.camera_method,
+        "rtsp_running": face_recognition.rtsp_running,
+        "rtsp_url": f"rtsp://localhost:{face_recognition.rtsp_port}/test" if face_recognition.rtsp_running else None,
         "endpoints": {
             "GET /": "This info",
+            "GET /video_player": "Web interface to view processed video stream",
+            "GET /video_feed": "MJPEG stream of processed frames",
             "POST /capture": "Capture and process a single frame",
+            "POST /start_rtsp": "Start RTSP streaming server (raw camera)",
+            "POST /stop_rtsp": "Stop RTSP streaming server",
+            "POST /start_streaming": "Start continuous camera streaming",
+            "POST /stop_streaming": "Stop continuous camera streaming",
+            "GET /status": "Get current status",
             "GET /ping": "Health check"
         }
     })
@@ -586,8 +782,202 @@ def capture():
         logger.error(f"Error processing capture: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route("/ping")
-def ping():
+@app.route("/start_rtsp", methods=['POST'])
+def start_rtsp():
+    """Start RTSP streaming server"""
+    try:
+        if face_recognition.start_rtsp_server():
+            return jsonify({
+                "success": True,
+                "message": "RTSP server started",
+                "rtsp_url": f"rtsp://localhost:{face_recognition.rtsp_port}/test",
+                "port": face_recognition.rtsp_port
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "Failed to start RTSP server"
+            }), 500
+    except Exception as e:
+        logger.error(f"Error starting RTSP server: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/stop_rtsp", methods=['POST'])
+def stop_rtsp():
+    """Stop RTSP streaming server"""
+    try:
+        face_recognition.stop_rtsp_server()
+        return jsonify({
+            "success": True,
+            "message": "RTSP server stopped"
+        })
+    except Exception as e:
+        logger.error(f"Error stopping RTSP server: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/start_streaming", methods=['POST'])
+def start_streaming():
+    """Start continuous camera streaming and processing"""
+    try:
+        face_recognition.start_streaming()
+        return jsonify({
+            "success": True,
+            "message": "Streaming started",
+            "camera_method": face_recognition.camera_method
+        })
+    except Exception as e:
+        logger.error(f"Error starting streaming: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/stop_streaming", methods=['POST'])
+def stop_streaming():
+    """Stop continuous camera streaming and processing"""
+    try:
+        face_recognition.stop_streaming()
+        return jsonify({
+            "success": True,
+            "message": "Streaming stopped"
+        })
+    except Exception as e:
+        logger.error(f"Error stopping streaming: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/status")
+def status():
+    """Get current status"""
+    try:
+        return jsonify({
+            "camera_method": face_recognition.camera_method,
+            "camera_running": face_recognition.camera_running,
+            "processing_running": face_recognition.processing_running,
+            "rtsp_running": face_recognition.rtsp_running,
+            "rtsp_url": f"rtsp://localhost:{face_recognition.rtsp_port}/test" if face_recognition.rtsp_running else None,
+            "fps": face_recognition.fps,
+            "avg_inference_time": face_recognition.avg_inference_time,
+            "last_results": face_recognition.last_results,
+            "frame_queue_size": face_recognition.frame_queue.qsize(),
+            "processed_queue_size": face_recognition.processed_frame_queue.qsize(),
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/video_feed")
+def video_feed():
+    """Video streaming route for processed frames (MJPEG)"""
+    def generate():
+        while True:
+            try:
+                # Get the latest processed frame
+                if face_recognition.last_frame is not None:
+                    frame = face_recognition.last_frame.copy()
+                    
+                    # Encode frame as JPEG
+                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    
+                    if ret:
+                        # Yield frame in MJPEG format
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + 
+                               buffer.tobytes() + b'\r\n')
+                    else:
+                        # If encoding fails, wait and continue
+                        time.sleep(0.1)
+                else:
+                    # No frame available, wait
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                logger.error(f"Error in video feed: {e}")
+                break
+                
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/video_player")
+def video_player():
+    """Simple HTML page to view the processed video stream"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Face Recognition Live Stream</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+            .container { max-width: 1200px; margin: 0 auto; }
+            .video-container { text-align: center; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            img { max-width: 100%; height: auto; border: 2px solid #333; border-radius: 5px; }
+            .controls { margin: 20px 0; }
+            button { padding: 10px 20px; margin: 5px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+            button:hover { background: #0056b3; }
+            .status { margin: 10px 0; padding: 10px; background: #e9ecef; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎥 Face Recognition Live Stream</h1>
+            
+            <div class="video-container">
+                <img src="/video_feed" alt="Live Video Stream" id="videoStream">
+                <div class="status" id="status">Loading...</div>
+            </div>
+            
+            <div class="controls">
+                <button onclick="refreshStream()">🔄 Refresh Stream</button>
+                <button onclick="getStatus()">📊 Get Status</button>
+                <button onclick="captureFrame()">📷 Capture Frame</button>
+            </div>
+            
+            <div id="info"></div>
+        </div>
+        
+        <script>
+            function refreshStream() {
+                const img = document.getElementById('videoStream');
+                img.src = img.src.split('?')[0] + '?' + new Date().getTime();
+            }
+            
+            function getStatus() {
+                fetch('/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('status').innerHTML = 
+                            `FPS: ${data.fps.toFixed(1)} | ` +
+                            `Inference: ${data.avg_inference_time.toFixed(1)}ms | ` +
+                            `Faces: ${data.last_results.length} | ` +
+                            `Camera: ${data.camera_running ? '✅' : '❌'} | ` +
+                            `RTSP: ${data.rtsp_running ? '✅' : '❌'}`;
+                    })
+                    .catch(error => {
+                        document.getElementById('status').innerHTML = '❌ Error getting status';
+                    });
+            }
+            
+            function captureFrame() {
+                fetch('/capture', {method: 'POST'})
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert(`Frame captured! Faces detected: ${data.faces.length}`);
+                        } else {
+                            alert('Capture failed: ' + data.error);
+                        }
+                    })
+                    .catch(error => {
+                        alert('Error: ' + error);
+                    });
+            }
+            
+            // Auto-refresh status every 2 seconds
+            setInterval(getStatus, 2000);
+            getStatus(); // Initial call
+        </script>
+    </body>
+    </html>
+    """
+    return html
+
     """Health check"""
     try:
         try:
@@ -600,7 +990,8 @@ def ping():
             "status": "OK",
             "model_service": model_status,
             "timestamp": datetime.now().isoformat(),
-            "camera_method": face_recognition.camera_method
+            "camera_method": face_recognition.camera_method,
+            "rtsp_running": face_recognition.rtsp_running
         })
     except Exception as e:
         logger.error(f"Error in ping: {e}")
@@ -608,8 +999,26 @@ def ping():
             "status": "ERROR",
             "model_service": "ERROR", 
             "timestamp": datetime.now().isoformat(),
-            "camera_method": "ERROR"
+            "camera_method": "ERROR",
+            "rtsp_running": False
         }), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    try:
+        # Start streaming automatically on startup
+        face_recognition.start_streaming()
+        
+        # Optionally start RTSP server automatically
+        rtsp_auto_start = os.environ.get('RTSP_AUTO_START', 'true').lower() == 'true'
+        if rtsp_auto_start:
+            face_recognition.start_rtsp_server()
+        
+        app.run(host="0.0.0.0", port=5001, debug=False)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        face_recognition.stop_rtsp_server()
+        face_recognition.stop_streaming()
+    except Exception as e:
+        logger.error(f"Error running application: {e}")
+        face_recognition.stop_rtsp_server()
+        face_recognition.stop_streaming()

@@ -1,0 +1,7 @@
+# Simple Jetson configuration
+device_ip: "192.168.2.100"
+username: "newcastleuni"
+ssh_key_path: "~/.ssh/jetson_key"
+deployment_base_path: "/home/newcastleuni/mlflow_deployments"
+timeout: 120
+max_retries: 33

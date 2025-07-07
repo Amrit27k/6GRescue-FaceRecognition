@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flask-based Face Recognition Inference Service for Jetson (System packages only)"""
+"""Flask-based Face Recognition Inference Service for Jetson with RTSP Streaming Support"""
 import cv2
 import numpy as np
 import time
@@ -54,11 +54,21 @@ class JetsonFaceRecognition:
         self.last_frame = None
         self.last_results = []
         self.last_method = "none"
+        self.last_processed_frame = None
+        self.last_capture_time = None
         
         # For camera streaming
         self.camera_running = False
         self.frame_queue = queue.Queue(maxsize=2)
         self.camera_thread = None
+        self.stream_lock = threading.Lock()
+        
+        # RTSP streaming variables
+        self.rtsp_process = None
+        self.rtsp_pipe = None
+        self.rtsp_port = 8554
+        self.rtsp_url = f"rtsp://0.0.0.0:{self.rtsp_port}/live"
+        self.rtsp_running = False
         
         # Detect best camera method
         self.camera_method = self.detect_camera_method()
@@ -131,8 +141,6 @@ class JetsonFaceRecognition:
         else:
             # If no location, use a null sink for testing pipeline validity
             cmd.append("fakesink") 
-            # For live preview during testing:
-            # cmd.extend(["nvegltransform", "!", "nveglglessink"])
         return cmd
 
     def test_csi_camera(self):
@@ -426,8 +434,6 @@ class JetsonFaceRecognition:
             if cap is not None and cap.isOpened():
                 cap.release() # Ensure camera is released
             
-
-    # ... (rest of your class, Flask routes, and main execution) ...
     def detect_faces(self, frame):
         """Detect faces in frame using Haar Cascade"""
         faces = []
@@ -506,6 +512,13 @@ class JetsonFaceRecognition:
         cv2.putText(processed_frame, info_text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
+        # Store last processed results
+        with self.stream_lock:
+            self.last_frame = frame
+            self.last_processed_frame = processed_frame
+            self.last_results = faces
+            self.last_capture_time = time.time()
+        
         return faces, processed_frame
         
     def recognize_face(self, face_roi):
@@ -538,6 +551,225 @@ class JetsonFaceRecognition:
         except Exception as e:
             logger.error(f"Error calling model service: {e}")
             return {"name": "Error", "confidence": 0, "person_id": None}
+    
+    def start_rtsp_server(self):
+        """Start HTTP-based streaming server that can be accessed via HTTP"""
+        # For now, we'll use HTTP streaming since true RTSP is complex
+        # This can be accessed via http://IP:8554/stream
+        self.rtsp_running = True
+        logger.info(f"HTTP streaming available on port 5001")
+        return True
+    
+    def start_simple_video_server(self):
+        """Start a simple video server using GStreamer"""
+        if self.rtsp_running:
+            return True
+            
+        try:
+            # Create a simple video streaming server
+            video_server_cmd = [
+                "gst-launch-1.0",
+                "-v",
+                "fdsrc", "fd=0",
+                "!",
+                "jpegdec",
+                "!",
+                "videoconvert",
+                "!",
+                "x264enc", "tune=zerolatency", "bitrate=1000", "speed-preset=ultrafast",
+                "!",
+                "mpegtsmux",
+                "!",
+                "tcpserversink", f"host=0.0.0.0", f"port={self.rtsp_port}", "recover-policy=keyframe", "sync-method=latest-keyframe"
+            ]
+            
+            self.rtsp_process = subprocess.Popen(
+                video_server_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            time.sleep(1)
+            if self.rtsp_process.poll() is None:
+                self.rtsp_running = True
+                logger.info(f"Video server started on TCP port {self.rtsp_port}")
+                logger.info(f"Connect with: gst-launch-1.0 tcpclientsrc host=192.168.2.100 port={self.rtsp_port} ! tsdemux ! h264parse ! avdec_h264 ! autovideosink")
+                return True
+            else:
+                logger.error("Video server failed to start")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to start video server: {e}")
+            return False
+        """Start simple UDP streaming for RTSP-like functionality"""
+        if self.rtsp_running:
+            return True
+            
+        try:
+            # Simple UDP streaming that can be received as RTSP-like
+            udp_cmd = [
+                "gst-launch-1.0",
+                "-v",
+                "fdsrc", "fd=0",
+                "!",
+                "jpegdec",
+                "!",
+                "videoconvert",
+                "!",
+                "videoscale",
+                "!",
+                f"video/x-raw,width={self.frame_width},height={self.frame_height}",
+                "!",
+                "x264enc", "tune=zerolatency", "bitrate=1000", "speed-preset=ultrafast",
+                "!",
+                "rtph264pay", "pt=96",
+                "!",
+                "udpsink", f"host=0.0.0.0", f"port={self.rtsp_port}"
+            ]
+            
+            self.rtsp_process = subprocess.Popen(
+                udp_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            self.rtsp_running = True
+            logger.info(f"Simple streaming started on UDP port {self.rtsp_port}")
+            logger.info(f"Connect with: gst-launch-1.0 udpsrc port={self.rtsp_port} ! application/x-rtp,payload=96 ! rtph264depay ! avdec_h264 ! autovideosink")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start simple streaming: {e}")
+            return False
+    
+    def stop_rtsp_server(self):
+        """Stop RTSP server"""
+        if self.rtsp_process:
+            try:
+                self.rtsp_process.terminate()
+                self.rtsp_process.wait(timeout=5)
+                logger.info("RTSP server stopped")
+            except subprocess.TimeoutExpired:
+                self.rtsp_process.kill()
+                logger.warning("RTSP server killed (timeout)")
+            except Exception as e:
+                logger.error(f"Error stopping RTSP server: {e}")
+            finally:
+                self.rtsp_process = None
+                self.rtsp_running = False
+        else:
+            logger.info("RTSP server not running")
+    
+    def start_camera_stream(self):
+        """Start continuous camera streaming with RTSP"""
+        if self.camera_running:
+            logger.info("Camera stream already running")
+            return True
+            
+        try:
+            # Start video server instead of UDP streaming
+            if not self.start_simple_video_server():
+                logger.warning("Video server failed to start, continuing with HTTP only")
+            
+            self.camera_running = True
+            self.camera_thread = threading.Thread(target=self._camera_stream_worker, daemon=True)
+            self.camera_thread.start()
+            logger.info(f"Camera stream started using {self.camera_method} method")
+            return True
+        except Exception as e:
+            logger.error(f"Error starting camera stream: {e}")
+            self.camera_running = False
+            return False
+    
+    def stop_camera_stream(self):
+        """Stop camera streaming and RTSP"""
+        if not self.camera_running:
+            logger.info("Camera stream not running")
+            return True
+            
+        try:
+            self.camera_running = False
+            if self.camera_thread:
+                self.camera_thread.join(timeout=5)
+            
+            # Stop RTSP server
+            self.stop_rtsp_server()
+            
+            logger.info("Camera stream and RTSP stopped")
+            return True
+        except Exception as e:
+            logger.error(f"Error stopping camera stream: {e}")
+            return False
+    
+    def _camera_stream_worker(self):
+        """Worker thread for continuous camera streaming with RTSP feed"""
+        logger.info("Camera stream worker started")
+        
+        while self.camera_running:
+            try:
+                frame = self.capture_frame()
+                if frame is not None:
+                    faces, processed_frame = self.process_frame(frame)
+                    
+                    # Put frame in queue for HTTP API
+                    if not self.frame_queue.full():
+                        self.frame_queue.put(processed_frame)
+                    
+                    # Feed frame to RTSP if running
+                    if self.rtsp_running and self.rtsp_process:
+                        self.feed_rtsp_frame(processed_frame)
+                        
+                else:
+                    logger.warning("Failed to capture frame in stream worker")
+                    time.sleep(0.1)  # Brief pause on failure
+                    
+            except Exception as e:
+                logger.error(f"Error in camera stream worker: {e}")
+                time.sleep(0.1)
+                
+        logger.info("Camera stream worker stopped")
+    
+    def feed_rtsp_frame(self, frame):
+        """Feed frame to RTSP server"""
+        if self.rtsp_process and self.rtsp_running and frame is not None:
+            try:
+                # Encode frame as JPEG
+                ret, jpeg_frame = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ret and self.rtsp_process.stdin:
+                    self.rtsp_process.stdin.write(jpeg_frame.tobytes())
+                    self.rtsp_process.stdin.flush()
+            except BrokenPipeError:
+                logger.warning("RTSP pipe broken, stopping RTSP")
+                self.rtsp_running = False
+            except Exception as e:
+                logger.error(f"Error feeding frame to RTSP: {e}")
+    
+    def get_stream_status(self):
+        """Get current streaming status"""
+        with self.stream_lock:
+            return {
+                "running": self.camera_running,
+                "rtsp_running": self.rtsp_running,
+                "fps": self.fps,
+                "inference_time": self.avg_inference_time,
+                "faces": self.last_results,
+                "method_used": self.last_method,
+                "last_capture": self.last_capture_time,
+                "rtsp_url": self.rtsp_url if self.rtsp_running else None,
+                "rtsp_port": self.rtsp_port
+            }
+    
+    def get_latest_frame_jpeg(self):
+        """Get the latest processed frame as JPEG bytes"""
+        with self.stream_lock:
+            if self.last_processed_frame is not None:
+                ret, buffer = cv2.imencode('.jpg', self.last_processed_frame)
+                if ret:
+                    return buffer.tobytes()
+        return None
 
 # Initialize face recognition system
 face_recognition = JetsonFaceRecognition()
@@ -553,7 +785,13 @@ def root():
         "endpoints": {
             "GET /": "This info",
             "POST /capture": "Capture and process a single frame",
-            "GET /ping": "Health check"
+            "GET /ping": "Health check",
+            "POST /stream/start": "Start camera streaming with RTSP",
+            "POST /stream/stop": "Stop camera streaming and RTSP", 
+            "GET /stream/status": "Get streaming status",
+            "GET /stream/frame": "Get latest frame as JPEG",
+            "GET /stream/mjpeg": "MJPEG video stream (works with VLC/browsers)",
+            "GET /stream/rtsp": "Get RTSP URL and connection info"
         }
     })
 
@@ -586,6 +824,116 @@ def capture():
         logger.error(f"Error processing capture: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/stream/start", methods=['POST'])
+def start_stream():
+    """Start camera streaming"""
+    try:
+        success = face_recognition.start_camera_stream()
+        if success:
+            return jsonify({
+                "success": True,
+                "message": "Camera stream started",
+                "method": face_recognition.camera_method,
+                "rtsp_url": face_recognition.rtsp_url,
+                "rtsp_running": face_recognition.rtsp_running,
+                "rtsp_port": face_recognition.rtsp_port
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "Failed to start camera stream"
+            }), 500
+    except Exception as e:
+        logger.error(f"Error starting stream: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/stream/stop", methods=['POST'])
+def stop_stream():
+    """Stop camera streaming"""
+    try:
+        success = face_recognition.stop_camera_stream()
+        if success:
+            return jsonify({
+                "success": True,
+                "message": "Camera stream stopped"
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "Failed to stop camera stream"
+            }), 500
+    except Exception as e:
+        logger.error(f"Error stopping stream: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/stream/status", methods=['GET'])
+def stream_status():
+    """Get streaming status"""
+    try:
+        status = face_recognition.get_stream_status()
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Error getting stream status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/stream/frame", methods=['GET'])
+def stream_frame():
+    """Get latest frame as JPEG"""
+    try:
+        frame_bytes = face_recognition.get_latest_frame_jpeg()
+        if frame_bytes:
+            return Response(frame_bytes, mimetype='image/jpeg')
+        else:
+            return jsonify({"error": "No frame available"}), 404
+    except Exception as e:
+        logger.error(f"Error getting stream frame: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/stream/mjpeg")
+def mjpeg_stream():
+    """MJPEG streaming endpoint - works with VLC and browsers"""
+    def generate():
+        while True:
+            try:
+                frame_bytes = face_recognition.get_latest_frame_jpeg()
+                if frame_bytes:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                else:
+                    # If no frame available, yield a small delay
+                    yield b'--frame\r\n\r\n'
+                time.sleep(0.1)  # ~10 FPS
+            except Exception as e:
+                logger.error(f"Error in MJPEG stream: {e}")
+                break
+    
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/stream/rtsp", methods=['GET'])
+def stream_rtsp_info():
+    """Get RTSP connection information"""
+    try:
+        if face_recognition.rtsp_running:
+            return jsonify({
+                "rtsp_running": True,
+                "rtsp_url": face_recognition.rtsp_url,
+                "rtsp_port": face_recognition.rtsp_port,
+                "connection_examples": {
+                    "mjpeg_vlc": f"vlc http://192.168.2.100:5001/stream/mjpeg",
+                    "mjpeg_browser": f"http://192.168.2.100:5001/stream/mjpeg",
+                    "single_frame": f"http://192.168.2.100:5001/stream/frame",
+                    "status_api": f"http://192.168.2.100:5001/stream/status"
+                }
+            })
+        else:
+            return jsonify({
+                "rtsp_running": False,
+                "message": "RTSP server not running. Start stream first with POST /stream/start"
+            })
+    except Exception as e:
+        logger.error(f"Error getting RTSP info: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/ping")
 def ping():
     """Health check"""
@@ -600,7 +948,8 @@ def ping():
             "status": "OK",
             "model_service": model_status,
             "timestamp": datetime.now().isoformat(),
-            "camera_method": face_recognition.camera_method
+            "camera_method": face_recognition.camera_method,
+            "stream_running": face_recognition.camera_running
         })
     except Exception as e:
         logger.error(f"Error in ping: {e}")
@@ -608,7 +957,8 @@ def ping():
             "status": "ERROR",
             "model_service": "ERROR", 
             "timestamp": datetime.now().isoformat(),
-            "camera_method": "ERROR"
+            "camera_method": "ERROR",
+            "stream_running": False
         }), 500
 
 if __name__ == "__main__":

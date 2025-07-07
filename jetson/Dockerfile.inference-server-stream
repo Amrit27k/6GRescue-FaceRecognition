@@ -3,7 +3,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Europe/London
 WORKDIR /app
 
-# Install ONLY system packages (ARM64 compatible)
+# Install ONLY system packages (ARM64 compatible) + RTSP support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.8 \
     python3.8-dev \
@@ -12,12 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libffi-dev \
     libssl-dev \
-    # python3-opencv \ # <--- REMOVE OR COMMENT THIS LINE
     gstreamer1.0-tools \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
+    gstreamer1.0-rtsp \
+    libgstrtspserver-1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
     curl \
     v4l-utils \
     opencv-data \
@@ -50,12 +52,8 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir MarkupSafe==2.1.5 \
     && pip install --no-cache-dir numpy requests Flask opencv-python-headless
 
-# Alternatively, if you use a requirements.txt:
-# COPY requirements.txt .
-# RUN pip install --no-cache-dir -r requirements.txt
-
-# ... (rest of your Dockerfile)
-COPY face_recognition_files/scripts/inference_server.py .
+# Copy your enhanced inference server script
+COPY face_recognition_files/scripts/inference_server_stream.py .
 
 # Create necessary directories
 RUN mkdir -p temp_frames output
@@ -63,10 +61,11 @@ RUN mkdir -p temp_frames output
 # Add video group for camera access
 RUN groupadd -g 44 video || true
 
-EXPOSE 5001
+# Expose both HTTP API and RTSP ports
+EXPOSE 5001 8554
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:5001/ping || exit 1
 
-CMD ["python3", "inference_server_test.py"]
+CMD ["python3", "inference_server_stream.py"]
