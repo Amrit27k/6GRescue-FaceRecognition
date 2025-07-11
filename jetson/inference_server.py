@@ -46,7 +46,7 @@ class JetsonFaceRecognition:
         self.start_time = time.time()
         self.inference_times = []
         
-        # Frame dimensions
+        # Frame dimensions - Make sure these are supported by your camera's modes!
         self.frame_width = 640
         self.frame_height = 480
         
@@ -70,80 +70,208 @@ class JetsonFaceRecognition:
         
     def detect_camera_method(self):
         """Detect the best available camera method"""
-        # Check for CSI camera (Jetson)
-        try:
-            result = subprocess.run("gst-inspect-1.0 nvarguscamerasrc", 
-                                  shell=True, capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                if self.test_csi_camera():
-                    return "csi"
-        except:
-            pass
         
-        # Check for USB camera with GStreamer
+        # --- CSI Camera Check (Jetson) ---
+        logger.info("Attempting CSI camera detection...")
+        if self.test_csi_camera():
+            logger.info("CSI camera detected and tested successfully.")
+            return "csi"
+        else:
+            logger.info("CSI camera test failed or not available.")
+        
+        # --- USB Camera Check with GStreamer ---
+        logger.info("Attempting USB camera (v4l2src) detection...")
         try:
-            result = subprocess.run("gst-inspect-1.0 v4l2src", 
-                                  shell=True, capture_output=True, text=True, timeout=5)
+            # First, check if v4l2src plugin exists and /dev/video0 is present
+            result = subprocess.run("gst-inspect-1.0 v4l2src", shell=True, capture_output=True, text=True, timeout=5)
             if result.returncode == 0 and os.path.exists("/dev/video0"):
+                logger.info("v4l2src plugin found and /dev/video0 exists. Testing USB camera...")
                 if self.test_usb_camera():
+                    logger.info("USB camera detected and tested successfully.")
                     return "usb"
-        except:
-            pass
+                else:
+                    logger.info("USB camera test failed.")
+            else:
+                logger.info(f"v4l2src inspect return: {result.returncode}, stderr: {result.stderr.strip()}")
+                logger.info("USB camera requirements (v4l2src or /dev/video0) not met.")
+        except subprocess.TimeoutExpired:
+            logger.warning("gst-inspect-1.0 v4l2src timed out.")
+        except Exception as e:
+            logger.error(f"Error during USB camera detection check: {e}")
         
-        # Fall back to OpenCV
-        if self.find_opencv_camera() is not None:
+        # --- Fall back to OpenCV ---
+        logger.info("Attempting OpenCV camera detection...")
+        opencv_id = self.find_opencv_camera()
+        if opencv_id is not None:
+            logger.info(f"OpenCV camera found at ID: {opencv_id}.")
             return "opencv"
-        
+        else:
+            logger.info("No OpenCV camera found.")
+            
         logger.warning("No camera method detected!")
         return "none"
-    
+        
+    def _construct_csi_gst_command(self, num_buffers=1, location=None):
+        """Helper to construct the CSI GStreamer command as a list for subprocess.run"""
+        cmd = [
+            "gst-launch-1.0",
+            "-e",
+            "nvarguscamerasrc",
+            f"num-buffers={num_buffers}",
+            "!",
+            f"video/x-raw(memory:NVMM),width={self.frame_width},height={self.frame_height},framerate=30/1",
+            "!",
+            "nvvidconv",
+            "!",
+            "jpegenc",
+            "!"
+        ]
+        if location:
+            cmd.extend(["filesink", f"location={location}"])
+        else:
+            # If no location, use a null sink for testing pipeline validity
+            cmd.append("fakesink") 
+            # For live preview during testing:
+            # cmd.extend(["nvegltransform", "!", "nveglglessink"])
+        return cmd
+
     def test_csi_camera(self):
-        """Test if CSI camera works"""
+        """Test if CSI camera works by capturing a single frame"""
         test_path = os.path.join(self.temp_dir, "test_csi.jpg")
-        gst_cmd = (
-            f"gst-launch-1.0 -e nvarguscamerasrc num-buffers=1 ! "
-            f"'video/x-raw(memory:NVMM),width=640,height=480,framerate=30/1' ! "
-            f"nvvidconv ! jpegenc ! filesink location={test_path}"
-        )
+        
+        # Clean up previous test file
+        if os.path.exists(test_path):
+            os.remove(test_path)
+            
+        # Use the helper to construct a robust command list
+        gst_cmd_list = self._construct_csi_gst_command(num_buffers=1, location=test_path)
+        
+        logger.info(f"CSI camera test command: {' '.join(gst_cmd_list)}")
         
         try:
-            result = subprocess.run(gst_cmd, shell=True, capture_output=True, text=True, timeout=10)
-            success = os.path.exists(test_path) and os.path.getsize(test_path) > 0
-            if os.path.exists(test_path):
-                os.remove(test_path)
+            # Run the command
+            result = subprocess.run(
+                gst_cmd_list,
+                capture_output=True,
+                text=True,
+                timeout=15 # Increased timeout slightly for first camera capture
+            )
+            
+            logger.debug(f"CSI test stdout: {result.stdout.strip()}")
+            logger.debug(f"CSI test stderr: {result.stderr.strip()}")
+            
+            # Check return code and whether the file was created and is not empty
+            success = (
+                result.returncode == 0 and
+                "ERROR:" not in result.stderr and # Look for GStreamer errors in stderr
+                "failed" not in result.stderr and # General failure keyword
+                os.path.exists(test_path) and
+                os.path.getsize(test_path) > 0
+            )
+            
+            if not success:
+                logger.warning(f"CSI camera test failed. Return code: {result.returncode}")
+                if result.stderr:
+                    logger.warning(f"CSI test stderr output: {result.stderr.strip()}")
+            
             return success
-        except:
+        except subprocess.TimeoutExpired:
+            logger.error("CSI camera test timed out.")
             return False
-    
+        except Exception as e:
+            logger.error(f"Error during CSI camera test: {e}")
+            return False
+            
     def test_usb_camera(self):
         """Test if USB camera works"""
         test_path = os.path.join(self.temp_dir, "test_usb.jpg")
-        gst_cmd = (
-            f"gst-launch-1.0 -e v4l2src device=/dev/video0 num-buffers=1 ! "
-            f"videoconvert ! jpegenc ! filesink location={test_path}"
-        )
+        
+        if os.path.exists(test_path):
+            os.remove(test_path)
+            
+        gst_cmd_list = [
+            "gst-launch-1.0",
+            "-e",
+            "v4l2src",
+            "device=/dev/video0",
+            "num-buffers=1",
+            "!",
+            "videoconvert",
+            "!",
+            "videoscale",
+            "!",
+            f"video/x-raw,width={self.frame_width},height={self.frame_height}",
+            "!",
+            "jpegenc",
+            "!",
+            "filesink",
+            f"location={test_path}"
+        ]
+        
+        logger.info(f"USB camera test command: {' '.join(gst_cmd_list)}")
         
         try:
-            result = subprocess.run(gst_cmd, shell=True, capture_output=True, text=True, timeout=10)
-            success = os.path.exists(test_path) and os.path.getsize(test_path) > 0
-            if os.path.exists(test_path):
-                os.remove(test_path)
+            result = subprocess.run(
+                gst_cmd_list,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            
+            logger.debug(f"USB test stdout: {result.stdout.strip()}")
+            logger.debug(f"USB test stderr: {result.stderr.strip()}")
+            
+            success = (
+                result.returncode == 0 and
+                "ERROR:" not in result.stderr and
+                "failed" not in result.stderr and
+                os.path.exists(test_path) and
+                os.path.getsize(test_path) > 0
+            )
+            
+            if not success:
+                logger.warning(f"USB camera test failed. Return code: {result.returncode}")
+                if result.stderr:
+                    logger.warning(f"USB test stderr output: {result.stderr.strip()}")
+                    
             return success
-        except:
+        except subprocess.TimeoutExpired:
+            logger.error("USB camera test timed out.")
             return False
-    
+        except Exception as e:
+            logger.error(f"Error during USB camera test: {e}")
+            return False
+            
     def find_opencv_camera(self):
         """Find working OpenCV camera"""
-        for camera_id in [0, 1, 2]:
+        for camera_id in [0, 1, 2]: # Iterate common camera IDs
+            logger.debug(f"Testing OpenCV camera ID: {camera_id}")
             try:
                 cap = cv2.VideoCapture(camera_id)
-                if cap.isOpened():
-                    ret, frame = cap.read()
+                if not cap.isOpened():
+                    logger.debug(f"OpenCV camera ID {camera_id} not opened.")
                     cap.release()
-                    if ret and frame is not None:
-                        return camera_id
-            except:
-                pass
+                    continue
+                
+                # Try setting properties (might fail if not supported, but doesn't hurt)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+                # For USB cams, MJPG is often preferred for higher resolutions/framerate
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G')) 
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                
+                # Attempt to read a frame
+                ret, frame = cap.read()
+                cap.release() # Release immediately
+                
+                if ret and frame is not None and frame.size > 0:
+                    logger.info(f"OpenCV camera found and working at ID: {camera_id} (captured frame shape: {frame.shape})")
+                    return camera_id
+                else:
+                    logger.debug(f"OpenCV camera ID {camera_id} opened but failed to read frame or frame is empty.")
+            except Exception as e:
+                logger.debug(f"Error testing OpenCV camera ID {camera_id}: {e}")
+        logger.info("No functional OpenCV camera found.")
         return None
         
     def capture_frame(self):
@@ -160,129 +288,162 @@ class JetsonFaceRecognition:
             
     def capture_frame_gstreamer_csi(self):
         """Capture frame using CSI camera with GStreamer"""
-        gst_cmd = (
-            f"gst-launch-1.0 -e nvarguscamerasrc num-buffers=1 ! "
-            f"'video/x-raw(memory:NVMM),width={self.frame_width},height={self.frame_height},framerate=30/1' ! "
-            f"nvvidconv ! jpegenc ! filesink location={self.temp_frame_path}"
-        )
+        # Removed shell=True, using list of arguments now
+        gst_cmd_list = self._construct_csi_gst_command(num_buffers=1, location=self.temp_frame_path)
         
         try:
             if os.path.exists(self.temp_frame_path):
                 os.remove(self.temp_frame_path)
             
-            process = subprocess.Popen(gst_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # Using subprocess.run for simplicity and better error handling
+            # It waits for the command to complete.
+            result = subprocess.run(gst_cmd_list, capture_output=True, text=True, timeout=10)
             
-            timeout = 5
-            start_time = time.time()
+            logger.debug(f"Capture CSI stdout: {result.stdout.strip()}")
+            logger.debug(f"Capture CSI stderr: {result.stderr.strip()}")
             
-            while process.poll() is None and time.time() - start_time < timeout:
-                time.sleep(0.01)
-            
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                logger.warning("GStreamer CSI process timed out")
+            if result.returncode != 0:
+                logger.warning(f"GStreamer CSI capture command failed with code {result.returncode}. Stderr: {result.stderr.strip()}")
                 return None
-            
+
             if os.path.exists(self.temp_frame_path) and os.path.getsize(self.temp_frame_path) > 0:
                 frame = cv2.imread(self.temp_frame_path)
-                if frame is not None:
+                if frame is not None and frame.size > 0:
                     self.last_method = "csi"
                     return frame
-            
-            logger.warning("CSI camera capture failed")
-            return None
+                else:
+                    logger.warning(f"CSI camera capture produced empty or invalid image file at {self.temp_frame_path}.")
+                    return None
+            else:
+                logger.warning(f"CSI camera capture failed: No file or empty file at {self.temp_frame_path}.")
+                return None
                 
+        except subprocess.TimeoutExpired:
+            logger.error("GStreamer CSI process timed out during capture.")
+            return None
         except Exception as e:
             logger.error(f"Error capturing CSI frame: {e}")
             return None
-    
+            
     def capture_frame_gstreamer_usb(self):
         """Capture frame using USB camera with GStreamer"""
-        gst_cmd = (
-            f"gst-launch-1.0 -e v4l2src device=/dev/video0 num-buffers=1 ! "
-            f"videoconvert ! videoscale ! video/x-raw,width={self.frame_width},height={self.frame_height} ! "
-            f"jpegenc ! filesink location={self.temp_frame_path}"
-        )
+        gst_cmd_list = [
+            "gst-launch-1.0",
+            "-e",
+            "v4l2src",
+            "device=/dev/video0",
+            "num-buffers=1",
+            "!",
+            "videoconvert",
+            "!",
+            "videoscale",
+            "!",
+            f"video/x-raw,width={self.frame_width},height={self.frame_height}",
+            "!",
+            "jpegenc",
+            "!",
+            "filesink",
+            f"location={self.temp_frame_path}"
+        ]
         
         try:
             if os.path.exists(self.temp_frame_path):
                 os.remove(self.temp_frame_path)
             
-            process = subprocess.Popen(gst_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = subprocess.run(gst_cmd_list, capture_output=True, text=True, timeout=10)
             
-            timeout = 5
-            start_time = time.time()
+            logger.debug(f"Capture USB stdout: {result.stdout.strip()}")
+            logger.debug(f"Capture USB stderr: {result.stderr.strip()}")
             
-            while process.poll() is None and time.time() - start_time < timeout:
-                time.sleep(0.01)
-            
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                logger.warning("GStreamer USB process timed out")
+            if result.returncode != 0:
+                logger.warning(f"GStreamer USB capture command failed with code {result.returncode}. Stderr: {result.stderr.strip()}")
                 return None
-            
+
             if os.path.exists(self.temp_frame_path) and os.path.getsize(self.temp_frame_path) > 0:
                 frame = cv2.imread(self.temp_frame_path)
-                if frame is not None:
+                if frame is not None and frame.size > 0:
                     self.last_method = "usb"
                     return frame
-            
-            logger.warning("USB camera capture failed")
-            return None
+                else:
+                    logger.warning(f"USB camera capture produced empty or invalid image file at {self.temp_frame_path}.")
+                    return None
+            else:
+                logger.warning(f"USB camera capture failed: No file or empty file at {self.temp_frame_path}.")
+                return None
                 
+        except subprocess.TimeoutExpired:
+            logger.error("GStreamer USB process timed out during capture.")
+            return None
         except Exception as e:
             logger.error(f"Error capturing USB frame: {e}")
             return None
-    
+            
     def capture_frame_opencv(self):
         """Capture frame using OpenCV"""
         if self.opencv_camera_id is None:
             logger.error("No OpenCV camera available")
             return None
         
+        cap = None # Initialize cap to None
         try:
             cap = cv2.VideoCapture(self.opencv_camera_id)
             if not cap.isOpened():
                 logger.error("Failed to open OpenCV camera")
                 return None
-            
+        
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))  # KEY FIX
             cap.set(cv2.CAP_PROP_FPS, 30)
-            
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer lag
+        
+            actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            logger.info(f"OpenCV camera actual settings: {actual_width}x{actual_height}")
+        
+            # Skip a few frames to let camera stabilize
             for _ in range(3):
                 ret, frame = cap.read()
-                time.sleep(0.1)
-            
+                if not ret:
+                    logger.warning("OpenCV: Failed to read frame during warmup.")
+                    break # Exit loop if read fails
+                time.sleep(0.05) # Shorter sleep
+        
             ret, frame = cap.read()
-            cap.release()
             
-            if ret and frame is not None:
+            if ret and frame is not None and frame.size > 0:
                 self.last_method = "opencv"
+                logger.debug(f"Captured frame: {frame.shape}, dtype: {frame.dtype}")
                 return frame
             else:
-                logger.error("Failed to capture OpenCV frame")
+                logger.error("Failed to capture OpenCV frame or frame is empty.")
                 return None
                 
         except Exception as e:
             logger.error(f"Error capturing OpenCV frame: {e}")
             return None
+        finally:
+            if cap is not None and cap.isOpened():
+                cap.release() # Ensure camera is released
+            
 
+    # ... (rest of your class, Flask routes, and main execution) ...
     def detect_faces(self, frame):
         """Detect faces in frame using Haar Cascade"""
         faces = []
         
         try:
             if not hasattr(self, 'detector'):
-                self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+                # Ensure the path to haarcascades is correct in a Docker container
+                # It should be available if opencv-python-headless is installed.
+                # You might need to add `opencv-data` package in your Dockerfile.
+                haar_cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+                if not os.path.exists(haar_cascade_path):
+                    logger.error(f"Haar cascade file not found: {haar_cascade_path}")
+                    # You might need to download it or ensure opencv-data is installed
+                    # Example: `RUN apt-get update && apt-get install -y opencv-data` in Dockerfile
+                    return []
+                self.detector = cv2.CascadeClassifier(haar_cascade_path)
             
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detected_faces = self.detector.detectMultiScale(gray, 1.1, 4, minSize=(50, 50))
@@ -298,7 +459,7 @@ class JetsonFaceRecognition:
             logger.error(f"Error detecting faces: {e}")
             
         return faces
-    
+        
     def process_frame(self, frame):
         """Process a frame - detect and recognize faces"""
         start_time = time.time()
@@ -328,7 +489,7 @@ class JetsonFaceRecognition:
                 label += f" ({face['confidence']:.0f}%)"
             
             cv2.putText(processed_frame, label, (x, y-10),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         inference_time = time.time() - start_time
         self.inference_times.append(inference_time)
@@ -343,7 +504,7 @@ class JetsonFaceRecognition:
         
         info_text = f"FPS: {self.fps:.1f} | Inference: {self.avg_inference_time:.1f}ms | Faces: {len(faces)} | {self.last_method.upper()}"
         cv2.putText(processed_frame, info_text, (10, 30),
-                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         return faces, processed_frame
         

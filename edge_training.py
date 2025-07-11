@@ -103,7 +103,7 @@ class EdgeFaceRecognitionTrainer:
         print("Loading YOLOv8 model...")
         try:
             from ultralytics import YOLO
-            self.model = YOLO("yolov8n-face.pt")  # Use face-specific model if available
+            self.model = YOLO("yolov8s.pt")
             self.model_type = "v8"
             print("Loaded YOLOv8 model successfully!")
         except Exception as e:
