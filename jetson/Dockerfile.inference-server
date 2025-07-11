@@ -3,7 +3,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Europe/London
 WORKDIR /app
 
-# Install ONLY system packages (ARM64 compatible)
+# Install system packages + RTSP support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.8 \
     python3.8-dev \
@@ -12,23 +12,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libffi-dev \
     libssl-dev \
-    # python3-opencv \ # <--- REMOVE OR COMMENT THIS LINE
+    # GStreamer and RTSP dependencies
     gstreamer1.0-tools \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
+    gstreamer1.0-rtsp \
+    libgstrtspserver-1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer1.0-dev \
+    # Development tools
+    gcc \
+    pkg-config \
     curl \
     v4l-utils \
     opencv-data \
-    # Added some additional dev libs often needed for OpenCV building via pip on ARM
+    # OpenCV dependencies
     libjpeg-dev \
     libpng-dev \
     libtiff-dev \
     libavcodec-dev \
     libavformat-dev \
     libswscale-dev \
-    libgstreamer1.0-dev \
     libxvidcore-dev \
     libx264-dev \
     libgtk-3-dev \
@@ -37,36 +43,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Set up a Python Virtual Environment using Python 3.8
+# Set up Python Virtual Environment
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3.8 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Upgrade pip and setuptools first
+# Upgrade pip and install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-
-# Install Python dependencies using pip into the virtual environment
-# IMPORTANT: Install opencv-python-headless here for the virtual environment
 RUN pip install --no-cache-dir MarkupSafe==2.1.5 \
-    && pip install --no-cache-dir numpy requests Flask opencv-python-headless
+    && pip install --no-cache-dir numpy requests Flask opencv-python-headless ultralytics
 
-# Alternatively, if you use a requirements.txt:
-# COPY requirements.txt .
-# RUN pip install --no-cache-dir -r requirements.txt
+# Copy the C RTSP server source and Python script
+COPY face_recognition_files/scripts/rtsp_server_fps.c .
+COPY face_recognition_files/scripts/inference_server_rtsp_v1.1.py .
 
-# ... (rest of your Dockerfile)
-COPY face_recognition_files/scripts/inference_server.py .
+# Compile the RTSP server
+RUN gcc rtsp_server_fps.c -o rtsp_server_fps $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 glib-2.0)
 
-# Create necessary directories
-RUN mkdir -p temp_frames output
+# Create directories and set permissions
+RUN mkdir -p temp_frames output \
+    && groupadd -g 44 video || true \
+    && chmod +x /app/rtsp_server_fps
 
-# Add video group for camera access
-RUN groupadd -g 44 video || true
+# Environment variables
+ENV MODEL_SERVICE_URL=http://localhost:5000
+ENV RTSP_PORT=8554
+ENV RTSP_AUTO_START=true
 
-EXPOSE 5001
+# Expose ports
+EXPOSE 5001 8554
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:5001/ping || exit 1
 
-CMD ["python3", "inference_server_test.py"]
+CMD ["python3", "inference_server_rtsp_v1.1.py"]

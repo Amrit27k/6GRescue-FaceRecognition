@@ -8,7 +8,6 @@ import logging
 import base64
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from PIL import Image
 import io
 import os
 
@@ -32,18 +31,20 @@ class LightweightFaceRecognitionModel:
             # Load face database
             with open('face_database.json', 'r') as f:
                 self.face_database = json.load(f)
-            
+            logger.info(f"Loaded face database with {len(self.face_database)} identities")
             # Load face features
             with open('face_features.pkl', 'rb') as f:
                 self.face_features = pickle.load(f)
-            
+            logger.info(f"Loaded face features with {len(self.face_features)} feature vectors")
             # Load model parameters
             if os.path.exists('model_params.json'):
                 with open('model_params.json', 'r') as f:
+                    logger.info("Loading model parameters from file")
                     params = json.load(f)
                     self.confidence_threshold = params.get("confidence_threshold", 0.6)
                     self.min_examples = params.get("min_examples", 3)
             else:
+                logger.info("Using default model parameters")
                 self.confidence_threshold = 0.6
                 self.min_examples = 3
             
@@ -116,69 +117,7 @@ class LightweightFaceRecognitionModel:
         train_accuracy = self.rf_model.score(X_scaled, y)
         logger.info(f"RandomForest training accuracy: {train_accuracy:.3f}")
     
-    def extract_features_pil(self, face_img_pil):
-        """Extract features using PIL only (no OpenCV)"""
-        try:
-            # Resize to standard size
-            face_resized = face_img_pil.resize((64, 64))
-            
-            # Convert to grayscale
-            if face_resized.mode != 'L':
-                gray = face_resized.convert('L')
-            else:
-                gray = face_resized
-            
-            # Convert to numpy array
-            gray_array = np.array(gray)
-            
-            # Histogram features
-            hist, _ = np.histogram(gray_array, bins=64, range=(0, 256))
-            hist = hist / (np.sum(hist) + 1e-7)  # Normalize
-            
-            # Simple texture features (without LBP)
-            h, w = gray_array.shape
-            texture_features = []
-            
-            # Sample texture at regular intervals
-            for i in range(4, h-4, 8):  # Sample every 8th pixel
-                for j in range(4, w-4, 8):
-                    # Get local patch
-                    patch = gray_array[i-2:i+3, j-2:j+3]
-                    if patch.shape == (5, 5):
-                        # Simple texture measures
-                        texture_features.extend([
-                            np.std(patch),           # Local standard deviation
-                            np.max(patch) - np.min(patch),  # Local range
-                            np.mean(patch > np.mean(patch))  # Binary threshold ratio
-                        ])
-            
-            # Pad or truncate texture features to fixed size
-            texture_features = texture_features[:60]  # Take first 60
-            while len(texture_features) < 60:
-                texture_features.append(0)  # Pad with zeros
-            
-            # Statistical features
-            stats = [
-                np.mean(gray_array), 
-                np.std(gray_array), 
-                np.min(gray_array), 
-                np.max(gray_array),
-                np.percentile(gray_array, 25), 
-                np.percentile(gray_array, 75),
-                np.median(gray_array),
-                len(gray_array[gray_array > np.mean(gray_array)]) / gray_array.size  # Above-mean ratio
-            ]
-            
-            # Combine all features
-            features = np.concatenate([hist, texture_features, stats])
-            return features
-            
-        except Exception as e:
-            logger.error(f"Feature extraction error: {e}")
-            # Return zero features if extraction fails
-            return np.zeros(64 + 60 + 8)  # hist + texture + stats
-    
-    def predict(self, face_img_pil):
+    def predict(self, query_features):
         """Predict face identity using RandomForest"""
         if self.rf_model is None:
             return {
@@ -188,8 +127,6 @@ class LightweightFaceRecognitionModel:
             }
         
         try:
-            # Extract features
-            query_features = self.extract_features_pil(face_img_pil)
             
             # Scale features
             query_features_scaled = self.scaler.transform([query_features])
@@ -254,8 +191,8 @@ def predict():
         results = []
         for instance in instances:
             # Decode base64 image
-            face_b64 = instance.get('face_image', '')
-            if not face_b64:
+            query_features = instance.get('image_feature_vector', '')
+            if not query_features:
                 results.append({
                     "name": "Error",
                     "confidence": 0,
@@ -265,16 +202,7 @@ def predict():
                 continue
                 
             try:
-                # Decode using PIL instead of OpenCV
-                face_data = base64.b64decode(face_b64)
-                face_img = Image.open(io.BytesIO(face_data))
-                
-                # Convert to RGB if needed
-                if face_img.mode in ('RGBA', 'P'):
-                    face_img = face_img.convert('RGB')
-                
-                # Predict
-                result = model.predict(face_img)
+                result = model.predict(query_features)
                 results.append(result)
                 
             except Exception as e:

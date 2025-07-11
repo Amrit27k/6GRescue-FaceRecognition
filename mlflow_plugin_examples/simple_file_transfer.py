@@ -149,6 +149,12 @@ class SimpleJetsonFileTransfer:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Simple MLflow Jetson File Transfer Example")
+    parser.add_argument('--model', type=str,
+                               help='Classifier model to deploy',
+                               required=True)
+    args = parser.parse_args()
     """Simple file transfer workflow example."""
     print("=" * 60)
     print("🚀 Simple MLflow Jetson File Transfer")
@@ -159,43 +165,46 @@ def main():
         jetson_ip="192.168.2.100",  # Your Jetson IP
         mlflow_uri="http://localhost:5000"  # Your MLflow server
     )
-    
-    try:
-        # Step 1: Transfer files
-        print("\n📁 Step 1: Transferring face recognition files...")
-        deployment = transfer_manager.transfer_face_recognition_files()
-        
-        # Step 2: Check what was transferred
-        print("\n🔍 Step 2: Checking transferred files...")
-        status = transfer_manager.check_transferred_files()
-        
-        # Step 3: List all transfers
-        print("\n📋 Step 3: Listing all file transfers...")
-        all_transfers = transfer_manager.list_all_transfers()
-        
-        # Final summary
-        print("\n" + "=" * 60)
-        print("✅ FILE TRANSFER COMPLETE!")
-        print("=" * 60)
-        print(f"📍 Files location on Jetson: {deployment['jetson_path']}")
-        print(f"📦 Transfer size: {deployment['size_mb']:.2f} MB")
-        print(f"📄 Files transferred: {len(deployment['transferred_files'])}")
-        print(f"📊 Status: {deployment['status']}")
-        
-        print("\n🔧 Next Steps:")
-        print("1. SSH to your Jetson device:")
-        print(f"   ssh newcastleuni@192.168.2.100")
-        print("2. Navigate to files:")
-        print(f"   cd {deployment['jetson_path']}")
-        print("3. Check files:")
-        print("   ls -la")
-        print("4. Run inference server manually:")
-        print("   cd scripts && python3 inference_server.py")
-        
-        return True
-        
-    except Exception as e:
-        print(f"\n❌ Transfer workflow failed: {str(e)}")
+    if args.model == "rf":
+        try:
+            # Step 1: Transfer files
+            print("\n📁 Step 1: Transferring face recognition files...")
+            deployment = transfer_manager.transfer_face_recognition_files()
+            
+            # Step 2: Check what was transferred
+            print("\n🔍 Step 2: Checking transferred files...")
+            status = transfer_manager.check_transferred_files()
+            
+            # Step 3: List all transfers
+            print("\n📋 Step 3: Listing all file transfers...")
+            all_transfers = transfer_manager.list_all_transfers()
+            
+            # Final summary
+            print("\n" + "=" * 60)
+            print("✅ FILE TRANSFER COMPLETE!")
+            print("=" * 60)
+            print(f"📍 Files location on Jetson: {deployment['jetson_path']}")
+            print(f"📦 Transfer size: {deployment['size_mb']:.2f} MB")
+            print(f"📄 Files transferred: {len(deployment['transferred_files'])}")
+            print(f"📊 Status: {deployment['status']}")
+            
+            print("\n🔧 Next Steps:")
+            print("1. SSH to your Jetson device:")
+            print(f"   ssh newcastleuni@192.168.2.100")
+            print("2. Navigate to files:")
+            print(f"   cd {deployment['jetson_path']}")
+            print("3. Check files:")
+            print("   ls -la")
+            print("4. Run inference server manually:")
+            print("   cd scripts && python3 inference_server.py")
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n❌ Transfer workflow failed: {str(e)}")
+            return False
+    else:
+        print(f"Plugin doesn't support the {args.model} model.")
         return False
 
 

@@ -28,15 +28,16 @@ class SimplePackageBuilder:
             "face_features.pkl": None,
             "face_database.json": None,
             "model_params.json": None,
-            "inference_server.py": None,
+            "inference_server_rtsp.py": None,
             "model_server.py": None,
-            "inference_server_stream.py": None,
             "client.py": None,
             "Dockerfile.inference-server": None,
             "Dockerfile.model-server": None,
-            "Dockerfile.inference-server-stream": None,
             "model_server_requirements.txt": None,
-            "inference_server_requirements.txt": None
+            "face_model_v2.pkl": None, 
+            "label_encoder.pkl": None, 
+            "random_forest_model.pkl": None,
+            "amrit_test.jpg": None
         }
         
         self._locate_files()
@@ -128,7 +129,7 @@ class SimplePackageBuilder:
         """Copy face recognition data files."""
         dest_dir.mkdir(parents=True, exist_ok=True)
         
-        data_files = ["face_features.pkl", "face_database.json", "model_params.json"]
+        data_files = ["face_features.pkl", "face_database.json", "model_params.json", "face_model_v2.pkl", "label_encoder.pkl", "random_forest_model.pkl"]
         copied_count = 0
         
         for file_name in data_files:
@@ -150,7 +151,7 @@ class SimplePackageBuilder:
         """Copy Python scripts."""
         dest_dir.mkdir(parents=True, exist_ok=True)
         
-        script_files = ["inference_server.py", "client.py", "model_server.py", "inference_server_stream.py"]
+        script_files = ["inference_server_rtsp.py", "client.py", "model_server.py", "amrit_test.jpg", ]
         copied_count = 0
         
         for script_name in script_files:
@@ -169,7 +170,7 @@ class SimplePackageBuilder:
     
     def _copy_docker_files(self, dest_dir: Path) -> None:
         """Copy Docker files if they exist."""
-        docker_files = ["Dockerfile.inference-server", "Dockerfile.model-server", "model_server_requirements.txt", "inference_server_requirements.txt", "Dockerfile.inference-server-stream"]
+        docker_files = ["Dockerfile.inference-server", "Dockerfile.model-server", "model_server_requirements.txt"]
         docker_files_found = []
         
         for docker_file in docker_files:
