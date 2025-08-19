@@ -7,7 +7,7 @@ Just transfers files to Jetson without running anything.
 import mlflow
 from mlflow.deployments import get_deploy_client
 import logging
-
+import time
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -169,8 +169,9 @@ def main():
         try:
             # Step 1: Transfer files
             print("\n📁 Step 1: Transferring face recognition files...")
+            start_time = time.time()
             deployment = transfer_manager.transfer_face_recognition_files()
-            
+            print(f"⏱️ Transfer completed in {time.time() - start_time:.2f} seconds")
             # Step 2: Check what was transferred
             print("\n🔍 Step 2: Checking transferred files...")
             status = transfer_manager.check_transferred_files()
