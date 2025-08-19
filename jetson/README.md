@@ -30,7 +30,7 @@ docker build -f face_recognition_files/docker/Dockerfile.model-server \
     -t face-model-mlf-plugin:latest .
 
 # Build inference server with RTSP support
-docker build -f Dockerfile.inference-server-rtsp \
+docker build -f docker/Dockerfile.inference-server-rtsp \
     -t face-inference-mlf-plugin-rtsp:latest .
 ```
 
@@ -55,9 +55,8 @@ docker run -d \
 
 # Run inference server with RTSP support
 docker run -d \
-    --name face-inference-mlf-plugin-rtsp \
+    --name face-inference-mlf-plugin-rtsp \:
     --runtime=nvidia \
-    --network host \
     -p 5001:5001 \
     -p 8554:8554 \
     -v $(pwd)/output:/app/output \
