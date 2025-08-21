@@ -1,43 +1,70 @@
 # Face Recognition Docker Setup with RTSP Streaming
 
-A containerized face recognition inference service for NVIDIA Jetson devices with CSI camera support and real-time RTSP streaming of processed frames.
+A containerized face recognition inference service for NVIDIA Jetson devices with CSI/USB camera support and real-time RTSP streaming of processed frames.
 
 ## Features
 
 - **Multi-camera support**: CSI, USB, and OpenCV camera detection
 - **NVIDIA runtime**: Optimized for Jetson hardware with GPU acceleration
 - **RTSP streaming**: Real-time H.264 stream with face detection overlays
-- **HTTP MJPEG stream**: Web-based video feed with face detection results
 - **REST API**: Flask-based inference service
-- **Client tools**: Python client for testing and monitoring
 - **Face detection**: Haar cascade-based face detection with ML model integration
 
 ## Prerequisites
 
-- NVIDIA Jetson device (Nano)
+- NVIDIA Jetson device (Nano/Orin)
 - Docker with NVIDIA runtime support
 - CSI camera connected (or USB camera)
-- Model service running on port 5000
-- GStreamer with RTSP server support
 
 ## Quick Start
 
-### 1. Build the Docker Images
+### 1. Setting the Service(Without and With Edge Setup)
 
-```bash
-# Build model server
-docker build -f face_recognition_files/docker/Dockerfile.model-server \
-    -t face-model-mlf-plugin:latest .
+#### a. Without Edge Setup
 
-# Build inference server with RTSP support
-docker build -f docker/Dockerfile.inference-server-rtsp \
-    -t face-inference-mlf-plugin-rtsp:latest .
-```
+- **Clone the Repository**:
+  ```bash
+  git clone https://github.com/Amrit27k/6GRescue-FaceRecognition.git
+  ```
+- **Inside the repository, enter inside 'jetson' directory**
+  ```bash
+  cd 6GRescue-FaceRecognition
+  cd jetson
+  ```
+- **Create a venv and activate (Optional)**
+  ```bash
+  python3 -m venv <env-name>
+  source <env-name>/bin/activate
+  ```
+#### b. With Edge Setup
+
+- **Use ansible playbook for jetson to setup the environment in jetson**
+Follow the setup instructions provided in the repository - 6GRescueServices[https://github.com/Amrit27k/6GRescueServices/blob/main/README.md]
+This will setup the edge environment with jupyterhub and clone the repository of the scripts.
+
+- **Use MLFlow plugin to deploy the model files and scripts to jetson**
+  ```bash
+  cd mlflow_plugin_examples
+  python simple_file_transfer.py --iot_ip 192.168.2.100 --model rf
+  ```
+
+### 2. Build the Docker Images
+  ```bash
+  # Build model server
+  cd mlflow_deployments_v<version-number>/face_recognition_files
+
+  docker build -f docker/Dockerfile.model-server \
+      -t face-model-mlf-plugin:latest .
+
+  # Build inference server with RTSP support
+  docker build -f docker/Dockerfile.inference-server-rtsp \
+      -t face-inference-mlf-plugin-rtsp:latest .
+  ```
 
 ### 2. Create Network (Optional)
-```bash
-docker network create face-net-mlf-plugin
-```
+  ```bash
+  docker network create face-net-mlf-plugin
+  ```
 
 ### 3. Run the Containers
 
@@ -45,7 +72,7 @@ docker network create face-net-mlf-plugin
 # Run model server
 docker run -d \
     --name face-model-mlf-plugin \
-    --network face-net-mlf-plugin \
+    --network face-net-mlf-plugin \  #Optional
     -p 5000:5000 \
     -v $(pwd)/models:/app/models \
     -v $(pwd)/logs:/app/logs \
@@ -78,6 +105,15 @@ docker run -d \
     face-inference-mlf-plugin-rtsp:latest
 ```
 
+### 3.a Run the inference script manually inside venv (optional)
+```bash
+source <venv-name>/bin/activate
+pip install --no-cache-dir MarkupSafe paho-mqtt torch torchvision numpy requests Flask opencv-python-headless ultralytics
+cd scripts/
+gcc rtsp_server_fps.c -o rtsp_server_fps $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 glib-2.0)
+python3 inference_server_v1.2.py
+```
+
 ### 4. Start Face Recognition and Streaming
 
 ```bash
@@ -93,13 +129,10 @@ curl http://localhost:5001/status
 
 ### 5. View the Streams
 
-**RTSP Stream with Face Detection Overlays (Recommended):**
+**RTSP Stream without Face Detection Overlays (Recommended):**
 ```bash
 # Using ffplay
 ffplay rtsp://localhost:8554/test
-
-# Using VLC
-vlc rtsp://localhost:8554/test
 
 # From remote machine
 ffplay rtsp://192.168.1.100:8554/test

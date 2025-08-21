@@ -78,10 +78,7 @@ sudo apt-get install python3-opencv
 
 1. **Clone the repository on edge server:**
    ```bash
-   mkdir face_recognition_system
-   cd face_recognition_system
-   mkdir edge_server
-   cd edge_server
+   cd 6GRescue-FaceRecognition
    ```
 
 2. **Copy the scripts:**
@@ -102,30 +99,7 @@ sudo apt-get install python3-opencv
 
 ### 2. Jetson Nano Setup
 
-1. **SSH into Jetson Nano:**
-   ```bash
-   ssh newcastleuni@192.168.50.94
-   ```
-
-2. **Create project directory:**
-   ```bash
-   mkdir ~/face_recognition
-   cd ~/face_recognition
-   ```
-
-3. **Copy the scripts:**
-   - Copy `jetson_inference.py` to Jetson
-   - Copy `mlflow_config.py` to Jetson
-
-4. **Initialize MLflow:**
-   ```bash
-   python3 mlflow_config.py
-   ```
-
-5. **Test camera connection:**
-   ```bash
-   python3 -c "import jetson_inference; jetson_inference.test_camera_connection()"
-   ```
+Read the README.md documentation inside the jetson directory to setup jetson using ansible playbook
 
 ### 3. Network Configuration
 
@@ -139,7 +113,7 @@ sudo apt-get install python3-opencv
 
 ## Usage
 
-### Training on Edge Server
+### Training on Edge Server inside edge_train.py notebook
 
 1. **Register new identities:**
    ```python
@@ -168,14 +142,10 @@ sudo apt-get install python3-opencv
    ```
 
 4. **Deploy to Jetson:**
-   ```python
-   trainer.deploy_to_jetson(jetson_ip="192.168.50.94")
-   ```
-
-   Then run the deployment script:
+   - **Use MLFlow plugin to deploy the model files and scripts to jetson**
    ```bash
-   cd jetson_deployment
-   ./deploy.sh
+   cd mlflow_plugin_examples
+   python simple_file_transfer.py --iot_ip 192.168.2.100 --model rf
    ```
 
 ### Inference on Jetson Nano
@@ -235,9 +205,6 @@ sudo apt-get install python3-opencv
 # On edge server
 cd jetson_deployment
 scp face_model.pkl face_database.json newcastleuni@192.168.50.94:~/face_recognition/models/
-
-# On Jetson
-python3 jetson_inference_simple.py --fetch-model
 ```
 
 ## Performance Optimization
