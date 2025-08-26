@@ -26,10 +26,9 @@ A containerized face recognition inference service for NVIDIA Jetson devices wit
   ```bash
   git clone https://github.com/Amrit27k/6GRescue-FaceRecognition.git
   ```
-- **Inside the repository, enter inside 'jetson' directory**
+- **Inside the repository**
   ```bash
   cd 6GRescue-FaceRecognition
-  cd jetson
   ```
 - **Create a venv and activate (Optional)**
   ```bash
@@ -44,11 +43,11 @@ This will setup the edge environment with jupyterhub and clone the repository of
 
 - **Use MLFlow plugin to deploy the model files and scripts to jetson**
   ```bash
-  cd mlflow_plugin_examples
+  cd 6GRescue-FaceRecognition/mlflow_plugin_examples
   python simple_file_transfer.py --iot_ip 192.168.2.100 --model rf
   ```
 
-### 2. Build the Docker Images
+### 2. Build the Docker Images in IOT(Jetson)
   ```bash
   # Build model server
   cd mlflow_deployments_v<version-number>/face_recognition_files
