@@ -153,6 +153,9 @@ def main():
     parser = argparse.ArgumentParser(description="Simple MLflow Jetson File Transfer Example")
     parser.add_argument('--model', type=str,
                                help='Classifier model to deploy',
+                               required=False)
+    parser.add_argument('--iot_ip', type=str,
+                               help='IOT IP Address to deploy',
                                required=True)
     args = parser.parse_args()
     """Simple file transfer workflow example."""
@@ -162,7 +165,7 @@ def main():
     
     # Initialize file transfer (update with your IPs)
     transfer_manager = SimpleJetsonFileTransfer(
-        jetson_ip="192.168.2.100",  # Your Jetson IP
+        jetson_ip=args.iot_ip,  # Your Jetson IP
         mlflow_uri="http://localhost:5000"  # Your MLflow server
     )
     if args.model == "rf":

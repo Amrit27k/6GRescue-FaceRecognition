@@ -135,7 +135,7 @@ class LightweightFaceRecognitionModel:
             probabilities = self.rf_model.predict_proba(query_features_scaled)[0]
             predicted_class = np.argmax(probabilities)
             confidence = probabilities[predicted_class]
-
+            logger.info(predicted_class)
             # Check if confidence meets threshold
             if confidence >= self.confidence_threshold:
                 predicted_name = self.reverse_label_encoder[predicted_class]

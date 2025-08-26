@@ -54,9 +54,9 @@ RUN pip install --no-cache-dir MarkupSafe==2.1.5 paho-mqtt torch torchvision\
     && pip install --no-cache-dir numpy requests Flask opencv-python-headless ultralytics
 
 # Copy the C RTSP server source and Python script
-COPY face_recognition_files/scripts/rtsp_server_fps.c .
-COPY face_recognition_files/scripts/inference_server_v1.2.py .
-COPY face_recognition_files/scripts/amrit_test.jpg .
+COPY scripts/rtsp_server_fps.c .
+COPY scripts/inference_server_v1.2.py .
+COPY scripts/amrit_test.jpg .
 # Compile the RTSP server
 RUN gcc rtsp_server_fps.c -o rtsp_server_fps $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 glib-2.0)
 
