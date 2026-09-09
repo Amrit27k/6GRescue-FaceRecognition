@@ -251,7 +251,8 @@ class JetsonFaceRecognitionRTSP:
             "!",
             "videoscale",
             "!",
-            f"video/x-raw,width={self.frame_width},height={self.frame_height},framerate=30/1 ! ", # Adjusted for GStreamer
+            f"video/x-raw,width={self.frame_width},height={self.frame_height},framerate=30/1", # Adjusted for GStreamer
+            "!",
             "jpegenc",
             "!",
             "filesink",
@@ -391,42 +392,43 @@ class JetsonFaceRecognitionRTSP:
 
             for r in results:
                 for box in r.boxes:
-                    # if int(box.cls[0]) == 0: # Check if the detected object is a 'person'
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    confidence = float(box.conf[0])
-                    logger.debug(f"Detected Box:{int(box.cls[0])} with confidence:{confidence:.2f}") # Debug level
+                    # TO-DO
+                    if int(box.cls[0]) == 0: # Check if the detected object is a 'person'
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        confidence = float(box.conf[0])
+                        logger.debug(f"Detected Box:{int(box.cls[0])} with confidence:{confidence:.2f}") # Debug level
 
-                    x1 = max(0, x1)
-                    y1 = max(0, y1)
-                    x2 = min(frame.shape[1], x2)
-                    y2 = min(frame.shape[0], y2)
+                        x1 = max(0, x1)
+                        y1 = max(0, y1)
+                        x2 = min(frame.shape[1], x2)
+                        y2 = min(frame.shape[0], y2)
 
-                    w = x2 - x1
-                    h = y2 - y1
+                        w = x2 - x1
+                        h = y2 - y1
 
-                    if w > 0 and h > 0:
-                        face_roi = frame[y1:y2, x1:x2]
+                        if w > 0 and h > 0:
+                            face_roi = frame[y1:y2, x1:x2]
 
-                        if face_roi.size > 0:
-                            logger.debug("Extracting features from face_roi.") # Debug level
-                            query_features = self.extract_features(face_roi) # Removed .flatten().reshape(1, -1) as .tolist() will handle it
+                            if face_roi.size > 0:
+                                logger.debug("Extracting features from face_roi.") # Debug level
+                                query_features = self.extract_features(face_roi) # Removed .flatten().reshape(1, -1) as .tolist() will handle it
 
-                            # Check if features were extracted successfully (not dummy data)
-                            if query_features.size == 0 or np.all(query_features == 0):
-                                logger.warning("Feature extraction returned empty or dummy data. Skipping recognition.")
-                                recognition_result = {"name": "Feature Error", "confidence": 0, "person_id": None}
+                                # Check if features were extracted successfully (not dummy data)
+                                if query_features.size == 0 or np.all(query_features == 0):
+                                    logger.warning("Feature extraction returned empty or dummy data. Skipping recognition.")
+                                    recognition_result = {"name": "Feature Error", "confidence": 0, "person_id": None}
+                                else:
+                                    # Pass the extracted features as a Python list to the recognition service
+                                    recognition_result = self.recognize_face(query_features.tolist())
+
+                                faces.append({
+                                    "box": [x1, y1, w, h],
+                                    "name": recognition_result.get("name", "Unknown"),
+                                    "confidence": recognition_result.get("confidence", 0),
+                                    "person_id": recognition_result.get("person_id", None)
+                                })
                             else:
-                                # Pass the extracted features as a Python list to the recognition service
-                                recognition_result = self.recognize_face(query_features.tolist())
-
-                            faces.append({
-                                "box": [x1, y1, w, h],
-                                "name": recognition_result.get("name", "Unknown"),
-                                "confidence": recognition_result.get("confidence", 0),
-                                "person_id": recognition_result.get("person_id", None)
-                            })
-                        else:
-                            logger.warning(f"Skipping empty face_roi for box: {[x1, y1, w, h]}")
+                                logger.warning(f"Skipping empty face_roi for box: {[x1, y1, w, h]}")
         except Exception as e:
             logger.error(f"Error during YOLOv8n face detection/recognition: {e}", exc_info=True) # Added exc_info
             return [], frame.copy()
@@ -450,7 +452,7 @@ class JetsonFaceRecognitionRTSP:
         try:
             data = {
                 "instances": [
-                    {"image_feature_vector": query_features_list} # CORRECTED: Send as image_feature_vector
+                    {"image_feature_vector": query_features_list} # Send as image_feature_vector
                 ]
             }
 
@@ -663,19 +665,19 @@ class JetsonFaceRecognitionRTSP:
                 frame = self.frame_queue.get(timeout=1) # Get frame from queue, with timeout
 
                 # Perform detection and recognition
-                #faces, raw_frame_copy = self.detect_and_recognize_faces_yolo(frame)
-                image_file = "amrit_test.jpg"
-                image_path = os.path.join(image_file)
-                logger.info(f"\nProcessing image: {image_file}")
-
-                frame = cv2.imread(image_path)
-                if frame is None:
-                    logger.error(f"Could not read image")
-
-                # Assuming ground truth can be extracted from filename (e.g., "amrit_1.jpg" -> "amrit")
-                ground_truth_name = image_file.split('_')[0].lower() # Adjust parsing based on your filename convention
-                logger.info(f"Ground Truth for {image_file}: {ground_truth_name}")
                 faces, raw_frame_copy = self.detect_and_recognize_faces_yolo(frame)
+                # image_file = "amrit_test.jpg"
+                # image_path = os.path.join(image_file)
+                # logger.info(f"\nProcessing image: {image_file}")
+
+                # frame = cv2.imread(image_path)
+                # if frame is None:
+                #     logger.error(f"Could not read image")
+
+                # # Assuming ground truth can be extracted from filename (e.g., "amrit_1.jpg" -> "amrit")
+                # ground_truth_name = image_file.split('_')[0].lower() # Adjust parsing based on your filename convention
+                # logger.info(f"Ground Truth for {image_file}: {ground_truth_name}")
+                # faces, raw_frame_copy = self.detect_and_recognize_faces_yolo(frame)
                 # Prepare data for JSON and MQTT
                 results_data = {
                     "timestamp": datetime.now().isoformat(),

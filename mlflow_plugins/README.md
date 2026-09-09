@@ -84,15 +84,6 @@ The plugin automatically finds and transfers:
 
 Files are extracted to: `/home/newcastleuni/mlflow_deployments/{deployment_name}/`
 
-## Manual Execution on Jetson
-
-After transfer, SSH to Jetson and run manually:
-```bash
-ssh newcastleuni@192.168.2.100
-cd /home/newcastleuni/mlflow_deployments/face_recognition_files/scripts/
-python3 inference_server.py
-```
-
 ## Development Mode
 
 When making changes to the plugin:

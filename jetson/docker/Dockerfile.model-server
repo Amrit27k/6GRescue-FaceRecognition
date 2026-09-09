@@ -12,13 +12,13 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY face_recognition_files/docker/model_server_requirements.txt requirements.txt
+COPY docker/model_server_requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# COPY face_recognition_files/scripts/model_server.py model_server.py
-# COPY face_recognition_files/data/face_database.json .
-# COPY face_recognition_files/data/face_features.pkl .
-# COPY face_recognition_files/data/model_params.json .
+COPY scripts/model_server.py model_server.py
+COPY data/face_database.json .
+COPY data/face_features.pkl .
+COPY data/model_params.json .
 
 # RUN mkdir -p models logs
 
