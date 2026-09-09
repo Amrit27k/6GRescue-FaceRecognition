@@ -104,7 +104,7 @@ sudo apt-get install python3-opencv
 
 1. **SSH into Jetson Nano:**
    ```bash
-   ssh newcastleuni@192.168.50.94
+   ssh newcastleuni@192.168.2.100
    ```
 
 2. **Create project directory:**
@@ -134,7 +134,7 @@ sudo apt-get install python3-opencv
    ```bash
    # On edge server
    ssh-keygen -t rsa
-   ssh-copy-id newcastleuni@192.168.50.94
+   ssh-copy-id newcastleuni@192.168.2.100
    ```
 
 ## Usage
@@ -169,7 +169,7 @@ sudo apt-get install python3-opencv
 
 4. **Deploy to Jetson:**
    ```python
-   trainer.deploy_to_jetson(jetson_ip="192.168.50.94")
+   trainer.deploy_to_jetson(jetson_ip="192.168.2.100")
    ```
 
    Then run the deployment script:
@@ -299,3 +299,33 @@ chmod 644 models/*
 3. **Distributed Training**: Support multi-edge training
 4. **Active Learning**: Automatically retrain on unknown faces
 5. **Privacy Features**: Add face anonymization options
+
+## LORA adapters
+1. https://huggingface.co/ngxson/Llama-3-Instruct-abliteration-LoRA-8B-F16-GGUF
+2. https://huggingface.co/lyliiiii/Phi2-Seq-classification-LoRa/tree/main
+3. https://huggingface.co/sam2ai/tiny_llama_1b_lora_pt/tree/main
+
+## Convert LoRA Adapter to GGUF Format
+# Steps:
+
+Train LoRA Adapter: Use deep learning frameworks like PyTorch to perform LoRA fine-tuning on the base model.
+Use Conversion Script: Use the convert_lora_to_gguf.py script provided by llama.cpp.
+```bash
+python llama.cpp/convert_lora_to_gguf.py --outfile ./SFT_LoRA_Merged/f16_LoRA.gguf --outtype f16 ./Llama-3.2-3B-Instruct-UltraChat/ 
+```
+
+# Notes:
+
+Ensure that the LoRA adapter and base model are compatible, i.e., based on the same architecture and version.
+The current conversion script does not support LoRA adapters that include token embeddings and language modeling heads.
+
+
+edge:  ssh akumar@22scomps001.ncl.ac.uk
+cloud: ssh akumar@22scomps003.ncl.ac.uk
+pass: jetson
+
+
+jupyterhub:edge
+user: akumar
+pass: jetson123
+

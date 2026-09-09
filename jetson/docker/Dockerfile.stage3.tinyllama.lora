@@ -1,0 +1,15 @@
+FROM tinyllama-server:latest
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+WORKDIR /app
+
+# Only new thing in this stage - the LoRA adapter
+COPY models/tinyllama-1.1b-rag-cv-v1-f16.gguf .
+
+ENV MODEL_NAME=tinyllama-1.1b-lora
+
+EXPOSE 5000
+HEALTHCHECK --interval=60s --timeout=30s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:5000/ping || exit 1
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", \
+     "--timeout", "120", "--access-logfile", "-", "model_server:app"]

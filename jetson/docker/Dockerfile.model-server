@@ -15,16 +15,16 @@ WORKDIR /app
 COPY face_recognition_files/docker/model_server_requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY face_recognition_files/scripts/model_server.py model_server.py
-COPY face_recognition_files/data/face_database.json .
-COPY face_recognition_files/data/face_features.pkl .
-COPY face_recognition_files/data/model_params.json .
+# COPY face_recognition_files/scripts/model_server.py model_server.py
+# COPY face_recognition_files/data/face_database.json .
+# COPY face_recognition_files/data/face_features.pkl .
+# COPY face_recognition_files/data/model_params.json .
 
-RUN mkdir -p models logs
+# RUN mkdir -p models logs
 
-EXPOSE 5000
+# EXPOSE 5000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:5000/ping || exit 1
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+#     CMD curl -f http://localhost:5000/ping || exit 1
 
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", "--access-logfile", "-", "model_server:app"]
+#CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", "--access-logfile", "-", "model_server:app"]
