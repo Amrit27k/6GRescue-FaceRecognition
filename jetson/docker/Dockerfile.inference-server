@@ -55,7 +55,7 @@ RUN pip install --no-cache-dir MarkupSafe==2.1.5 paho-mqtt torch torchvision\
 
 # Copy the C RTSP server source and Python script
 COPY scripts/rtsp_server_fps.c .
-COPY scripts/inference_server_v1.2.py .
+COPY scripts/jetson_object_inference_v1.2.0.py .
 COPY scripts/amrit_test.jpg .
 # Compile the RTSP server
 RUN gcc rtsp_server_fps.c -o rtsp_server_fps $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 glib-2.0)
@@ -77,4 +77,4 @@ EXPOSE 5001 8554
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:5001/ping || exit 1
 
-CMD ["python3", "inference_server_v1.2.py"]
+CMD ["python3", "jetson_object_inference_v1.2.0.py"]
