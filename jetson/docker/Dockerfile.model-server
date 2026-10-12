@@ -15,16 +15,14 @@ WORKDIR /app
 COPY docker/model_server_requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scripts/model_server.py model_server.py
-COPY data/face_database.json .
-COPY data/face_features.pkl .
-COPY data/model_params.json .
+COPY scripts/model_server_v1.1.py model_server.py
+COPY data/v1/random_forest_model.pkl data/v1/label_encoder.pkl data/v1/face_database.json /app/models/
 
-# RUN mkdir -p models logs
+RUN mkdir -p models logs
 
-# EXPOSE 5000
+EXPOSE 5000
 
-# HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-#     CMD curl -f http://localhost:5000/ping || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+     CMD curl -f http://localhost:5000/ping || exit 1
 
-#CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", "--access-logfile", "-", "model_server:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "60", "--access-logfile", "-", "model_server:app"]

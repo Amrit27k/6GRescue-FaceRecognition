@@ -1,0 +1,5 @@
+jetson-venv/
+jetson/scripts/rtsp_server_fps
+jetson/scripts/yolo*
+jetson/scripts/captured/
+jetson/scripts/output/
